@@ -53,6 +53,7 @@ DEFAULT_QUOTA_THRESHOLD = 95
 DEFAULT_OUTPUT = "invalid_codex_accounts.json"
 DEFAULT_QUOTA_OUTPUT = "invalid_quota_accounts.json"
 DEFAULT_ACTIVE_QUOTA_OUTPUT = "active_quota_history.jsonl"
+DEFAULT_STANDBY_OUTPUT = "standby_accounts.json"
 STREAM_ERROR_ACTIVE_MESSAGE = "stream error: stream disconnected before completion: stream closed before response.completed"
 
 
@@ -336,13 +337,39 @@ async def check_quota_accounts(
         quota_marked_by_status = False
         status_message = item.get("status_message")
         sm_data = as_json_obj(status_message)
-        sm_error = sm_data.get("error") if isinstance(sm_data, dict) else {}
+        status_text = str(status_message or "").lower()
+
+        limit_keywords = (
+            "usage_limit_reached",
+            "insufficient_quota",
+            "quota_exceeded",
+            "limit_reached",
+            "rate limit",
+        )
+
+        sm_error = sm_data.get("error") if isinstance(sm_data, dict) else None
         if isinstance(sm_error, dict):
-            sm_type = sm_error.get("type")
-            if sm_type in ("usage_limit_reached", "insufficient_quota", "quota_exceeded"):
+            sm_type = str(sm_error.get("type") or "").lower()
+            sm_code = str(sm_error.get("code") or "").lower()
+            sm_msg = str(sm_error.get("message") or "").lower()
+            if any(k in sm_type or k in sm_code or k in sm_msg for k in limit_keywords):
                 quota_marked_by_status = True
-                if sm_error.get("resets_at") is not None:
-                    result["reset_at"] = sm_error.get("resets_at")
+            if sm_error.get("resets_at") is not None:
+                result["reset_at"] = sm_error.get("resets_at")
+        elif isinstance(sm_error, str):
+            sm_error_text = sm_error.lower()
+            if any(k in sm_error_text for k in limit_keywords):
+                quota_marked_by_status = True
+
+        if not quota_marked_by_status and isinstance(sm_data, dict):
+            top_type = str(sm_data.get("type") or "").lower()
+            top_code = str(sm_data.get("code") or "").lower()
+            top_msg = str(sm_data.get("message") or "").lower()
+            if any(k in top_type or k in top_code or k in top_msg for k in limit_keywords):
+                quota_marked_by_status = True
+
+        if not quota_marked_by_status and any(k in status_text for k in limit_keywords):
+            quota_marked_by_status = True
 
         if not auth_index:
             result["error"] = "missing auth_index"
@@ -502,7 +529,7 @@ async def check_quota_accounts(
                                 elif result["quota_source"] == "5hour":
                                     result["invalid_quota"] = used_percent >= primary_quota_threshold
 
-                            # 无 used_percent 时，使用 remaining/limit_reached/allowed 兜底识别无额度
+                            # 无 used_percent 时，使用 remaining/limit_reached/allowed 兜底识别额度耗尽
                             if result.get("used_percent") is None:
                                 remaining_zero = any(w.get("remaining") == 0 for w in windows)
                                 weekly_limit_reached = bool(weekly_window and weekly_window.get("limit_reached") is True)
@@ -535,6 +562,12 @@ async def check_quota_accounts(
                             result["reset_at"] = weekly_reset_at or short_reset_at or result.get("reset_at")
                         elif sc == 401:
                             result["invalid_401"] = True
+                        else:
+                            # 接口非200但状态消息明确提示额度耗尽时，仍按无额度处理
+                            if quota_marked_by_status:
+                                result["used_percent"] = 100
+                                result["invalid_quota"] = True
+                                result["quota_source"] = "status_message"
 
                         if sc is None:
                             result["error"] = "missing status_code in api-call response"
@@ -645,7 +678,7 @@ async def delete_names(base_url, token, names, delete_workers, timeout):
 class EnhancedUI(tk.Tk):
     def __init__(self, conf, config_path):
         super().__init__()
-        self.title("CliproxyAccountCleaner v1.2.2")
+        self.title("CliproxyAccountCleaner v1.3.0")
         self.geometry("1220x760")
         self.minsize(1080, 640)
 
@@ -655,6 +688,7 @@ class EnhancedUI(tk.Tk):
         self.filtered_accounts = []
         self._compact_usage_mode = False
         self._layout_update_job = None
+        self._on_help_page = False
 
         self._init_config_vars()
         self._setup_styles()
@@ -672,7 +706,7 @@ class EnhancedUI(tk.Tk):
         self.primary_quota_threshold_var = tk.StringVar(value=str(self.conf.get("primary_quota_threshold") or DEFAULT_QUOTA_THRESHOLD))
 
         auto_interval = int(self.conf.get("auto_interval_minutes") or 30)
-        self.auto_enabled_var = tk.BooleanVar(value=bool(self.conf.get("auto_enabled", False)))
+        self.auto_enabled_var = tk.BooleanVar(value=False)
         self.auto_interval_var = tk.StringVar(value=str(max(1, auto_interval)))
 
         auto_401_action = str(self.conf.get("auto_action_401") or "删除")
@@ -685,6 +719,12 @@ class EnhancedUI(tk.Tk):
             auto_quota_action = "关闭"
         self.auto_quota_action_var = tk.StringVar(value=auto_quota_action)
 
+        keep_active_count = int(self.conf.get("auto_keep_active_count") or 0)
+        self.auto_keep_active_var = tk.StringVar(value=str(max(0, keep_active_count)))
+        self.auto_allow_closed_scan_var = tk.BooleanVar(value=bool(self.conf.get("auto_allow_scan_closed", False)))
+
+        self.standby_names = self._load_standby_names_from_file()
+
         self._auto_job = None
         self._auto_running = False
 
@@ -695,99 +735,166 @@ class EnhancedUI(tk.Tk):
         except Exception:
             pass
 
-        bg = "#eef6ff"
-        panel_bg = "#ffffff"
+        bg = "#f3f6fb"
+        card_bg = "#ffffff"
+        text_main = "#0f172a"
+        text_sub = "#475569"
+
         self.configure(bg=bg)
 
         style.configure("TFrame", background=bg, relief="flat", borderwidth=0)
+        style.configure("Card.TFrame", background=card_bg, relief="flat", borderwidth=0)
+        style.configure("CardInner.TFrame", background=card_bg, relief="flat", borderwidth=0)
+
         style.configure("TLabelframe", background=bg, relief="flat", borderwidth=0)
-        style.configure("TLabelframe.Label", background=bg, foreground="#0f172a")
-        style.configure("TLabel", background=bg, foreground="#0f172a")
-        style.configure("TEntry", fieldbackground="#ffffff", borderwidth=0)
-        style.configure("TCombobox", fieldbackground="#f4f8fc", borderwidth=0, relief="flat", foreground="#1f2937", arrowsize=14)
-        style.map("TCombobox", fieldbackground=[("readonly", "#f4f8fc")], selectbackground=[("readonly", "#dbe7f3")], selectforeground=[("readonly", "#1f2937")])
+        style.configure("TLabelframe.Label", background=bg, foreground=text_main)
+        style.configure("Card.TLabelframe", background=bg, relief="flat", borderwidth=0)
+        style.configure("Card.TLabelframe.Label", background=bg, foreground=text_main)
 
-        style.configure("TCheckbutton", background=bg, foreground="#334155")
-        style.map("TCheckbutton", background=[("active", bg)], foreground=[("active", "#1e293b")])
-        style.configure("Treeview", rowheight=24, fieldbackground=panel_bg, background=panel_bg, borderwidth=0)
-        style.configure("Treeview.Heading", padding=(8, 6), background="#dbeafe", foreground="#0f172a", borderwidth=0)
+        style.configure("TLabel", background=bg, foreground=text_main)
+        style.configure("Header.TLabel", background=card_bg, foreground=text_main, font=("Microsoft YaHei UI", 13, "bold"))
+        style.configure("Subtle.TLabel", background=card_bg, foreground=text_sub)
 
-        style.configure("Unified.TButton", padding=(12, 6), background="#8fa7bf", foreground="#f8fafc", borderwidth=0, relief="flat")
-        style.map("Unified.TButton", background=[("active", "#839db6"), ("pressed", "#778fa8")], relief=[("pressed", "flat"), ("active", "flat")])
+        style.configure("TEntry", fieldbackground="#ffffff", borderwidth=1)
+        style.configure(
+            "TCombobox",
+            fieldbackground="#ffffff",
+            borderwidth=1,
+            relief="flat",
+            foreground="#1f2937",
+            arrowsize=14,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", "#ffffff")],
+            selectbackground=[("readonly", "#dbeafe")],
+            selectforeground=[("readonly", "#1f2937")],
+        )
+
+        style.configure("TCheckbutton", background=card_bg, foreground="#334155")
+        style.map("TCheckbutton", background=[("active", card_bg)], foreground=[("active", "#1e293b")])
+
+        style.configure("Treeview", rowheight=26, fieldbackground=card_bg, background=card_bg, borderwidth=0)
+        style.configure("Treeview.Heading", padding=(8, 7), background="#e2e8f0", foreground=text_main, borderwidth=0)
+
+        button_bg = "#90aecd"
+        button_bg_active = "#7f9fbe"
+        button_bg_pressed = "#6f90b0"
+        button_fg = "#f4f8fc"
+
+        for btn_style in ("Primary.TButton", "Neutral.TButton", "Warn.TButton", "Danger.TButton"):
+            style.configure(btn_style, padding=(12, 7), background=button_bg, foreground=button_fg, borderwidth=0, relief="flat")
+            style.map(
+                btn_style,
+                background=[("active", button_bg_active), ("pressed", button_bg_pressed)],
+                relief=[("pressed", "flat"), ("active", "flat")],
+            )
 
     def _build(self):
-        top = ttk.Frame(self, padding=10)
-        top.pack(fill="x")
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=0, minsize=28)
+        self.grid_columnconfigure(0, weight=1)
+
+        main = ttk.Frame(self, padding=(6, 4, 6, 4))
+        main.grid(row=0, column=0, sticky="nsew")
+
+        header = ttk.Frame(main, style="Card.TFrame", padding=(6, 2))
+        header.pack(fill="x", pady=(0, 1))
+        header.columnconfigure(0, weight=1)
 
         self.status = tk.StringVar(value="正在加载账号列表...")
-        ttk.Label(top, textvariable=self.status).pack(side="left")
+        ttk.Label(header, textvariable=self.status, style="Subtle.TLabel").grid(row=0, column=0, sticky="w")
 
-        ttk.Button(top, text="刷新", command=self._load_accounts, style="Unified.TButton").pack(side="right")
-        ttk.Button(top, text="退出", command=self.destroy, style="Unified.TButton").pack(side="right", padx=8)
+        top_actions = ttk.Frame(header, style="Card.TFrame")
+        top_actions.grid(row=0, column=1, sticky="e")
+        ttk.Button(top_actions, text="刷新账号列表", command=self._load_accounts, style="Primary.TButton").pack(side="left")
+        self.help_btn = ttk.Button(top_actions, text="使用说明", command=self._toggle_help_page, style="Neutral.TButton")
+        self.help_btn.pack(side="left", padx=(8, 0))
+        ttk.Button(top_actions, text="关闭窗口", command=self.destroy, style="Neutral.TButton").pack(side="left", padx=(8, 0))
 
-        cfg = ttk.LabelFrame(self, text="基础参数", padding=(10, 8))
-        cfg.pack(fill="x", padx=10, pady=(0, 6))
+        self.main_content = ttk.Frame(main)
+        self.main_content.pack(fill="both", expand=True)
 
-        row1 = ttk.Frame(cfg)
-        row1.pack(fill="x", pady=(0, 4))
-        ttk.Label(row1, text="服务地址(base_url)").pack(side="left")
-        ttk.Entry(row1, textvariable=self.base_url_var, width=40).pack(side="left", padx=(6, 12))
-        ttk.Label(row1, text="令牌(token/cpa_password)").pack(side="left")
-        ttk.Entry(row1, textvariable=self.token_var, width=30, show="*").pack(side="left", padx=(6, 0))
+        config_wrap = ttk.Frame(self.main_content)
+        config_wrap.pack(fill="x", pady=(0, 2))
 
-        row2 = ttk.Frame(cfg)
-        row2.pack(fill="x")
-        ttk.Label(row2, text="并发(workers)").pack(side="left")
-        ttk.Entry(row2, textvariable=self.workers_var, width=8).pack(side="left", padx=(6, 12))
-        ttk.Label(row2, text="额度并发(quota_workers)").pack(side="left")
-        ttk.Entry(row2, textvariable=self.quota_workers_var, width=8).pack(side="left", padx=(6, 12))
-        ttk.Label(row2, text="删除并发(delete_workers)").pack(side="left")
-        ttk.Entry(row2, textvariable=self.delete_workers_var, width=8).pack(side="left", padx=(6, 12))
+        cfg = ttk.LabelFrame(config_wrap, text="连接与检测参数", style="Card.TLabelframe", padding=(8, 5))
+        cfg.pack(fill="x", pady=(0, 6))
+        cfg_top_row = ttk.Frame(cfg)
+        cfg_top_row.pack(fill="x", pady=(0, 3))
+        cfg_top_row.columnconfigure(1, weight=1)
+        cfg_top_row.columnconfigure(3, weight=1)
 
-        row3 = ttk.Frame(cfg)
-        row3.pack(fill="x", pady=(8, 0))
-        ttk.Label(row3, text="周额度阈值:").pack(side="left")
-        ttk.Entry(row3, textvariable=self.weekly_quota_threshold_var, width=8).pack(side="left", padx=(6, 12))
-        ttk.Label(row3, text="5小时额度阈值:").pack(side="left")
-        ttk.Entry(row3, textvariable=self.primary_quota_threshold_var, width=8).pack(side="left", padx=(6, 0))
+        ttk.Label(cfg_top_row, text="管理端地址 (base_url)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(cfg_top_row, textvariable=self.base_url_var).grid(row=0, column=1, sticky="ew", padx=(8, 18))
 
-        auto = ttk.LabelFrame(self, text="定时检测", padding=(10, 8))
-        auto.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(cfg_top_row, text="访问令牌 (token / cpa_password)").grid(row=0, column=2, sticky="w")
+        ttk.Entry(cfg_top_row, textvariable=self.token_var, show="*").grid(row=0, column=3, sticky="ew", padx=(8, 0))
 
-        auto_row = ttk.Frame(auto)
-        auto_row.pack(fill="x")
-        ttk.Checkbutton(auto_row, text="启用定时任务", variable=self.auto_enabled_var).pack(side="left")
-        ttk.Label(auto_row, text="间隔(分钟)").pack(side="left", padx=(10, 4))
-        ttk.Entry(auto_row, textvariable=self.auto_interval_var, width=6).pack(side="left", padx=(0, 10))
+        params_row = ttk.Frame(cfg)
+        params_row.pack(fill="x")
+        ttk.Label(params_row, text="401 检测并发").pack(side="left")
+        ttk.Entry(params_row, textvariable=self.workers_var, width=8).pack(side="left", padx=(6, 14))
+        ttk.Label(params_row, text="额度检测并发").pack(side="left")
+        ttk.Entry(params_row, textvariable=self.quota_workers_var, width=8).pack(side="left", padx=(6, 14))
+        ttk.Label(params_row, text="删除并发").pack(side="left")
+        ttk.Entry(params_row, textvariable=self.delete_workers_var, width=8).pack(side="left", padx=(6, 22))
 
-        ttk.Label(auto_row, text="401账号操作").pack(side="left", padx=(0, 4))
+        ttk.Label(params_row, text="周额度阈值 (%)").pack(side="left")
+        ttk.Entry(params_row, textvariable=self.weekly_quota_threshold_var, width=8).pack(side="left", padx=(6, 14))
+        ttk.Label(params_row, text="5 小时额度阈值 (%)").pack(side="left")
+        ttk.Entry(params_row, textvariable=self.primary_quota_threshold_var, width=8).pack(side="left", padx=(6, 14))
+        ttk.Label(params_row, text="活跃账号目标数").pack(side="left")
+        ttk.Entry(params_row, textvariable=self.auto_keep_active_var, width=7).pack(side="left", padx=(6, 0))
+
+        auto = ttk.LabelFrame(config_wrap, text="自动巡检设置", style="Card.TLabelframe", padding=(8, 5))
+        auto.pack(fill="x", pady=(0, 2))
+
+        auto_row1 = ttk.Frame(auto)
+        auto_row1.pack(fill="x", pady=(0, 3))
+        ttk.Label(auto_row1, text="巡检间隔 (分钟)").pack(side="left")
+        ttk.Entry(auto_row1, textvariable=self.auto_interval_var, width=7).pack(side="left", padx=(6, 14))
+        ttk.Label(auto_row1, text="401 账号处理").pack(side="left")
         ttk.Combobox(
-            auto_row,
+            auto_row1,
             textvariable=self.auto_401_action_var,
             values=["删除", "仅标记"],
             state="readonly",
-            width=8,
-        ).pack(side="left", padx=(0, 10))
+            width=9,
+        ).pack(side="left", padx=(6, 14))
 
-        ttk.Label(auto_row, text="无额度账号操作").pack(side="left", padx=(0, 4))
+        ttk.Label(auto_row1, text="额度耗尽账号处理").pack(side="left")
         ttk.Combobox(
-            auto_row,
+            auto_row1,
             textvariable=self.auto_quota_action_var,
             values=["关闭", "删除", "仅标记"],
             state="readonly",
-            width=8,
-        ).pack(side="left", padx=(0, 10))
+            width=9,
+        ).pack(side="left", padx=(6, 14))
 
-        ttk.Button(auto_row, text="启动定时任务", command=self.start_auto_check, style="Unified.TButton").pack(side="left", padx=(0, 6))
-        ttk.Button(auto_row, text="停止定时任务", command=self.stop_auto_check, style="Unified.TButton").pack(side="left")
+        ttk.Checkbutton(
+            auto_row1,
+            text="不足时允许从已关闭账号补齐",
+            variable=self.auto_allow_closed_scan_var,
+        ).pack(side="left", padx=(0, 14))
 
-        self.auto_status_var = tk.StringVar(value="定时任务：未启动")
-        ttk.Label(auto, textvariable=self.auto_status_var).pack(side="left", pady=(6, 0))
+        self.auto_toggle_btn = ttk.Button(
+            auto_row1,
+            text="停止自动巡检" if self.auto_enabled_var.get() else "启动自动巡检",
+            command=self.toggle_auto_check,
+            style="Primary.TButton",
+        )
+        self.auto_toggle_btn.pack(side="left", padx=(0, 6))
+
+        self.auto_status_var = tk.StringVar(value="自动巡检状态：未启动")
+        ttk.Label(auto, textvariable=self.auto_status_var, style="Subtle.TLabel").pack(side="left", pady=(7, 0))
 
         self.auto_interval_var.trace_add("write", lambda *_: self._save_config())
         self.auto_401_action_var.trace_add("write", lambda *_: self._save_config())
         self.auto_quota_action_var.trace_add("write", lambda *_: self._save_config())
         self.auto_enabled_var.trace_add("write", lambda *_: self._save_config())
+        self.auto_keep_active_var.trace_add("write", lambda *_: self._save_config())
+        self.auto_allow_closed_scan_var.trace_add("write", lambda *_: self._save_config())
 
         # 运行参数改动后也持久化到 config.json
         self.base_url_var.trace_add("write", lambda *_: self._save_config())
@@ -798,76 +905,54 @@ class EnhancedUI(tk.Tk):
         self.weekly_quota_threshold_var.trace_add("write", lambda *_: self._save_config())
         self.primary_quota_threshold_var.trace_add("write", lambda *_: self._save_config())
 
-        filter_frame = ttk.Frame(self, padding=(10, 0, 10, 5))
-        filter_frame.pack(fill="x")
+        filter_frame = ttk.LabelFrame(self.main_content, text="筛选与搜索", style="Card.TLabelframe", padding=(8, 5))
+        filter_frame.pack(fill="x", pady=(0, 2))
 
-        ttk.Label(filter_frame, text="过滤:").pack(side="left")
+        ttk.Label(filter_frame, text="关键词").pack(side="left")
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", self._apply_filter)
-        ttk.Entry(filter_frame, textvariable=self.filter_var, width=30).pack(side="left", padx=5)
+        ttk.Entry(filter_frame, textvariable=self.filter_var, width=34).pack(side="left", padx=(6, 16))
 
+        ttk.Label(filter_frame, text="状态筛选").pack(side="left")
         self.filter_status = ttk.Combobox(
             filter_frame,
-            values=["全部", "错误", "活跃", "未知", "已关闭", "401失效", "无额度"],
+            values=["全部", "错误", "活跃", "未知", "已关闭", "备用", "401无效", "额度耗尽"],
             state="readonly",
             width=10,
         )
         self.filter_status.set("全部")
         self.filter_status.bind("<<ComboboxSelected>>", self._apply_filter)
-        self.filter_status.pack(side="left", padx=5)
+        self.filter_status.pack(side="left", padx=(6, 12))
+        ttk.Label(filter_frame, text="提示：双击表格行可切换勾选状态", style="Subtle.TLabel").pack(side="left")
 
-        status_frame = ttk.Frame(self, relief="flat", padding=(4, 1))
-        status_frame.pack(side="bottom", fill="x")
-        status_frame.columnconfigure(0, weight=1)
+        ops = ttk.LabelFrame(self.main_content, text="批量操作", style="Card.TLabelframe", padding=(8, 5))
+        ops.pack(fill="x", pady=(0, 2))
 
-        self.status_bar = tk.StringVar(value="就绪")
-        self.status_label = tk.Label(
-            status_frame,
-            textvariable=self.status_bar,
-            anchor="w",
-            justify="left",
-            bg="#e0f2fe",
-            fg="#0f172a",
-        )
-        self.status_label.grid(row=0, column=0, sticky="ew")
-
-        self.brand_label = tk.Label(
-            status_frame,
-            text="海十Mirage的AI工具ai.hsnb.fun",
-            anchor="e",
-            justify="right",
-            bg="#e0f2fe",
-            fg="#1e3a8a",
-        )
-        self.brand_label.grid(row=0, column=1, sticky="e", padx=(8, 0))
-        status_frame.bind("<Configure>", self._update_status_wrap)
-
-        mid = ttk.Frame(self, padding=(10, 0, 10, 10))
-        mid.pack(fill="both", expand=True)
-
-        bar = ttk.Frame(mid)
-        bar.pack(fill="x", pady=(0, 6))
-
-        ttk.Button(bar, text="全选", command=self.select_all, style="Unified.TButton").pack(side="left")
-        ttk.Button(bar, text="全不选", command=self.select_none, style="Unified.TButton").pack(side="left", padx=6)
-
-        ttk.Button(bar, text="检查401", command=self.check_401, style="Unified.TButton").pack(side="left", padx=6)
-        ttk.Button(bar, text="检查额度", command=self.check_quota, style="Unified.TButton").pack(side="left", padx=6)
-        ttk.Button(bar, text="检查401+额度", command=self.check_both, style="Unified.TButton").pack(side="left", padx=6)
-
-        ttk.Button(bar, text="关闭选中", command=self.close_selected, style="Unified.TButton").pack(side="left", padx=12)
-        ttk.Button(bar, text="恢复已关闭", command=self.recover_closed_accounts, style="Unified.TButton").pack(side="left", padx=6)
-        ttk.Button(bar, text="永久删除", command=self.delete_selected, style="Unified.TButton").pack(side="left", padx=6)
+        ops_row = ttk.Frame(ops)
+        ops_row.pack(fill="x")
+        ttk.Button(ops_row, text="全选", command=self.select_all, style="Neutral.TButton").pack(side="left")
+        ttk.Button(ops_row, text="取消全选", command=self.select_none, style="Neutral.TButton").pack(side="left", padx=(6, 10))
+        ttk.Button(ops_row, text="检测401无效", command=self.check_401, style="Primary.TButton").pack(side="left", padx=(0, 6))
+        ttk.Button(ops_row, text="检测额度", command=self.check_quota, style="Primary.TButton").pack(side="left", padx=6)
+        ttk.Button(ops_row, text="检测（401+额度）", command=self.check_both, style="Primary.TButton").pack(side="left", padx=6)
+        ttk.Button(ops_row, text="关闭选中账号", command=self.close_selected, style="Warn.TButton").pack(side="left", padx=6)
+        ttk.Button(ops_row, text="恢复已关闭", command=self.recover_closed_accounts, style="Neutral.TButton").pack(side="left", padx=6)
+        ttk.Button(ops_row, text="加入备用池", command=self.add_selected_to_standby, style="Neutral.TButton").pack(side="left", padx=6)
+        ttk.Button(ops_row, text="移出备用池", command=self.remove_selected_from_standby, style="Neutral.TButton").pack(side="left", padx=6)
+        ttk.Button(ops_row, text="永久删除", command=self.delete_selected, style="Danger.TButton").pack(side="left", padx=(6, 0))
 
         self.action_progress = tk.StringVar(value="")
-        ttk.Label(bar, textvariable=self.action_progress).pack(side="right")
+        ttk.Label(ops, textvariable=self.action_progress, style="Subtle.TLabel").pack(fill="x", pady=(6, 0))
+
+        table_panel = ttk.Frame(self.main_content)
+        table_panel.pack(fill="both", expand=True)
 
         columns = ("account", "status", "usage_limit", "error_info")
-        self.tree = ttk.Treeview(mid, columns=columns, show="headings", height=24)
+        self.tree = ttk.Treeview(table_panel, columns=columns, show="headings", height=24)
 
-        self.tree.heading("account", text="账号/邮箱")
+        self.tree.heading("account", text="账号 / 邮箱")
         self.tree.heading("status", text="状态")
-        self.tree.heading("usage_limit", text="额度信息")
+        self.tree.heading("usage_limit", text="额度详情")
         self.tree.heading("error_info", text="错误信息")
 
         self.tree.column("account", width=300, minwidth=180, anchor="w")
@@ -875,34 +960,144 @@ class EnhancedUI(tk.Tk):
         self.tree.column("usage_limit", width=420, minwidth=260, anchor="w")
         self.tree.column("error_info", width=320, minwidth=180, anchor="w")
 
-        yscroll = ttk.Scrollbar(mid, orient="vertical", command=self.tree.yview)
+        yscroll = ttk.Scrollbar(table_panel, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=yscroll.set)
 
         self.tree.pack(side="left", fill="both", expand=True)
         yscroll.pack(side="right", fill="y")
 
+        self.help_page = ttk.Frame(main, style="Card.TFrame", padding=(14, 12))
+        self.help_page.columnconfigure(0, weight=1)
+        self.help_page.rowconfigure(0, weight=1)
+
+        self.help_canvas = tk.Canvas(self.help_page, highlightthickness=0, bg="#f3f6fb")
+        self.help_canvas.grid(row=0, column=0, sticky="nsew")
+
+        help_scroll = ttk.Scrollbar(self.help_page, orient="vertical", command=self.help_canvas.yview)
+        help_scroll.grid(row=0, column=1, sticky="ns")
+        self.help_canvas.configure(yscrollcommand=help_scroll.set)
+
+        self.help_inner = ttk.Frame(self.help_canvas, style="Card.TFrame")
+        self._help_window = self.help_canvas.create_window((0, 0), window=self.help_inner, anchor="nw")
+        self.help_inner.bind("<Configure>", self._on_help_inner_configure)
+        self.help_canvas.bind("<Configure>", self._on_help_canvas_configure)
+
+        help_card = ttk.LabelFrame(self.help_inner, text="使用说明", style="Card.TLabelframe", padding=(14, 12))
+        help_card.pack(fill="both", expand=True)
+
+        ttk.Label(help_card, text="一、快速上手", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(help_card, text="1) 填写“管理端地址(base_url)”和“访问令牌(token/cpa_password)”。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="2) 点击“刷新账号列表”，确认账号已加载。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="3) 活跃账号目标数（全局参数）：在自动巡检、检测、移出备用、恢复已关闭等涉及开启账号的流程中都会生效；系统会把活跃账号控制在目标数以内。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="4) 不足时允许从已关闭账号补齐（全局参数）：开启后，备用池不够时会继续扫描已关闭账号。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="5) 先执行“检测401无效 / 检测额度 / 联合检测”，再进行关闭、恢复、删除。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="6) 401无效账号推荐删除 / 无额度账号推荐关闭 / 错误账号通常不需要额外操作", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="7) 可用关键词+状态筛选；双击表格行可勾选/取消勾选。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x", pady=(0, 8))
+
+        ttk.Separator(help_card, orient="horizontal").pack(fill="x", pady=(2, 8))
+
+        ttk.Label(help_card, text="二、状态与筛选说明", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(help_card, text="- 状态判定采用统一优先级（从高到低）：401无效 > 备用 > 已关闭 > 额度耗尽 > 活跃 > 错误 > 未知。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 活跃：检测通过，可正常使用。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 错误：接口返回异常或检测失败。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 未知：新导入的账号，尚未完成有效检测（建议优先检测）。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 已关闭：手动关闭的账号，可通过点击“恢复已关闭”按钮检测后恢复使用。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 备用：账号在备用池中，默认不参与主流程。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 401无效：认证无效账号，可直接删除，无限保留。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 额度耗尽：命中额度阈值或限额信号，且不属于401。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 若账号同时命中多个状态（如既在备用池又401失效），界面会优先显示“401无效”。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Separator(help_card, orient="horizontal").pack(fill="x", pady=(2, 8))
+
+        ttk.Label(help_card, text="三、备用池说明", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(help_card, text="- 加入备用池：将选中账号加入备用列表，并立即关闭账号。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 移出备用池：会先做 401+额度检测，仅“状态正常且非额度耗尽”的账号会开启并移入活跃账号池，并且移出备用池。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 自动补齐活跃账号时，系统会优先从备用池挑选可恢复账号。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x", pady=(0, 8))
+
+        ttk.Separator(help_card, orient="horizontal").pack(fill="x", pady=(2, 8))
+
+        ttk.Label(help_card, text="四、自动巡检说明（重点）", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(help_card, text="- 巡检间隔：按分钟周期执行。启动后会先立即执行一次。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 401处理：删除/仅标记；额度处理：关闭/删除/仅标记（按你的下拉选项执行）。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x", pady=(0, 8))
+
+        ttk.Separator(help_card, orient="horizontal").pack(fill="x", pady=(2, 8))
+
+        ttk.Label(help_card, text="五、复杂操作与风险提示", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
+        ttk.Label(help_card, text="- 推荐流程：联合检测（401+额度） → 核对状态 → 批量关闭/恢复/删除。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- “并发值”：并发值越高检测速度越快，性能消耗越大（消耗的是cliproxy api所在机器的能），推荐自动巡检时设置小并发数。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- “永久删除”：不可恢复，请先确认筛选条件和勾选结果。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 如检测结果异常，先检查 base_url、token 和网络连通性，再重试。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x", pady=(0, 10))
+
+        ttk.Button(help_card, text="返回主界面", command=self._toggle_help_page, style="Primary.TButton").pack(anchor="w")
+
+        self.bind_all("<MouseWheel>", self._on_help_mousewheel, add="+")
+        self.bind_all("<Button-4>", self._on_help_mousewheel, add="+")
+        self.bind_all("<Button-5>", self._on_help_mousewheel, add="+")
+
+        status_frame = ttk.Frame(self, relief="flat", padding=(6, 1), height=26)
+        status_frame.grid(row=1, column=0, sticky="ew")
+        status_frame.grid_propagate(False)
+        status_frame.columnconfigure(0, weight=1)
+
+        self.status_bar = tk.StringVar(value="准备就绪")
+        self.status_label = tk.Label(
+            status_frame,
+            textvariable=self.status_bar,
+            anchor="w",
+            justify="left",
+            bg="#e2e8f0",
+            fg="#0f172a",
+        )
+        self.status_label.grid(row=0, column=0, sticky="ew")
+        status_frame.bind("<Configure>", self._update_status_wrap)
+
         self.tree.bind("<Double-1>", self.toggle_item)
         self.tree.bind("<Configure>", self._on_tree_resize)
         self.after(80, self._update_tree_columns)
 
+    def _on_help_inner_configure(self, _event=None):
+        try:
+            self.help_canvas.configure(scrollregion=self.help_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_help_canvas_configure(self, event):
+        try:
+            self.help_canvas.itemconfigure(self._help_window, width=event.width)
+        except Exception:
+            pass
+
+    def _on_help_mousewheel(self, event):
+        if not self._on_help_page:
+            return
+        delta = getattr(event, "delta", 0)
+        if delta:
+            step = -1 if delta > 0 else 1
+            self.help_canvas.yview_scroll(step, "units")
+            return
+
+        num = getattr(event, "num", None)
+        if num == 4:
+            self.help_canvas.yview_scroll(-1, "units")
+        elif num == 5:
+            self.help_canvas.yview_scroll(1, "units")
+
+    def _toggle_help_page(self):
+        if self._on_help_page:
+            self.help_page.pack_forget()
+            self.main_content.pack(fill="both", expand=True)
+            self.help_btn.configure(text="使用说明")
+            self._on_help_page = False
+            self.status_bar.set("已返回主界面")
+        else:
+            self.main_content.pack_forget()
+            self.help_page.pack(fill="both", expand=True)
+            self.help_btn.configure(text="返回主界面")
+            self._on_help_page = True
+            self.status_bar.set("当前为使用说明页面")
+
     def _update_status_wrap(self, event):
         total_width = int(getattr(event, "width", 0) or 0)
-        brand_width = 0
-        try:
-            brand_width = int(self.brand_label.winfo_reqwidth())
-        except Exception:
-            brand_width = 0
-
-        # 窗口较窄时让品牌文字换到下一行，避免遮挡状态提示
-        if total_width < 960:
-            self.brand_label.grid_configure(row=1, column=0, columnspan=2, sticky="e", padx=(0, 0))
-        else:
-            self.brand_label.grid_configure(row=0, column=1, columnspan=1, sticky="e", padx=(8, 0))
-
-        if total_width < 960:
-            width = max(120, total_width - 20)
-        else:
-            width = max(120, total_width - brand_width - 30)
+        width = max(120, total_width - 20)
         try:
             self.status_label.configure(wraplength=width)
         except Exception:
@@ -1026,6 +1221,18 @@ class EnhancedUI(tk.Tk):
             self.conf["auto_action_401"] = self.auto_401_action_var.get()
             self.conf["auto_action_quota"] = self.auto_quota_action_var.get()
 
+            keep_active_text = str(self.auto_keep_active_var.get() or "").strip()
+            try:
+                keep_active = int(keep_active_text)
+                if keep_active >= 0:
+                    self.conf["auto_keep_active_count"] = keep_active
+            except Exception:
+                pass
+
+            self.conf["auto_allow_scan_closed"] = bool(self.auto_allow_closed_scan_var.get())
+            self.conf["standby_output"] = self.conf.get("standby_output") or DEFAULT_STANDBY_OUTPUT
+            self.conf.pop("standby_accounts", None)
+
             with open(self.config_path, "w", encoding="utf-8") as f:
                 json.dump(self.conf, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -1074,13 +1281,237 @@ class EnhancedUI(tk.Tk):
             "output": self.conf.get("output") or DEFAULT_OUTPUT,
             "quota_output": self.conf.get("quota_output") or DEFAULT_QUOTA_OUTPUT,
             "active_quota_output": self.conf.get("active_quota_output") or DEFAULT_ACTIVE_QUOTA_OUTPUT,
+            "auto_keep_active_count": max(0, int(self.auto_keep_active_var.get() or 0)),
+            "auto_allow_scan_closed": bool(self.auto_allow_closed_scan_var.get()),
         }
+
+    def _active_target_count(self):
+        try:
+            return max(0, int(self.auto_keep_active_var.get() or 0))
+        except Exception:
+            return max(0, int(self.conf.get("auto_keep_active_count") or 0))
+
+    def _current_active_count(self):
+        count = 0
+        for account in (self.all_accounts or []):
+            if self._status_bucket(account) == "活跃":
+                count += 1
+        return count
+
+    def _pick_names_with_active_target_limit(self, names):
+        ordered = []
+        seen = set()
+        for name in (names or []):
+            n = str(name or "").strip()
+            if not n or n in seen:
+                continue
+            seen.add(n)
+            ordered.append(n)
+
+        target_active = self._active_target_count()
+        current_active = self._current_active_count()
+
+        # 目标数<=0 视为不限制
+        if target_active <= 0:
+            return {
+                "selected": ordered,
+                "skipped": [],
+                "target_active": target_active,
+                "current_active": current_active,
+                "available_slots": len(ordered),
+                "unlimited": True,
+            }
+
+        available_slots = max(0, target_active - current_active)
+        selected = ordered[:available_slots]
+        skipped = ordered[available_slots:]
+
+        return {
+            "selected": selected,
+            "skipped": skipped,
+            "target_active": target_active,
+            "current_active": current_active,
+            "available_slots": available_slots,
+            "unlimited": False,
+        }
+
+    def _rebalance_active_target_by_runtime(self, rt):
+        summary = {
+            "target_active": max(0, int(rt.get("auto_keep_active_count") or 0)),
+            "active_before": 0,
+            "active_after": 0,
+            "moved_to_standby_count": 0,
+            "enabled_count": 0,
+            "enforce_applied": False,
+            "enforce_skipped": False,
+            "error_count": 0,
+            "error": None,
+        }
+
+        try:
+            target_active = summary["target_active"]
+            if target_active <= 0:
+                summary["enforce_skipped"] = True
+                return summary
+
+            files = fetch_auth_files(rt["base_url"], rt["token"], rt["timeout"])
+            primary_candidates = self._collect_primary_auto_candidates_from_files(files, rt)
+            summary["active_before"] = len(primary_candidates)
+
+            overflow_result = self._move_active_overflow_to_standby(rt, primary_candidates, target_active)
+            summary["moved_to_standby_count"] = len(overflow_result.get("moved_to_standby") or [])
+
+            rebalance_errors = []
+            rebalance_errors.extend(overflow_result.get("move_errors") or [])
+
+            files = fetch_auth_files(rt["base_url"], rt["token"], rt["timeout"])
+            current_primary = self._collect_primary_auto_candidates_from_files(files, rt)
+            need_count = max(0, target_active - len(current_primary))
+
+            picked_names = []
+            standby_scan_errors = []
+            closed_scan_errors = []
+            standby_file_dirty = False
+
+            if need_count > 0:
+                standby_candidates = self._collect_standby_candidates_from_files(files, rt)
+                standby_scan = self._scan_for_recovery(rt, standby_candidates, need_count)
+                picked_names.extend(standby_scan.get("recoverable") or [])
+                standby_scan_errors.extend(standby_scan.get("errors") or [])
+
+                standby_probe_by_name = standby_scan.get("probe_by_name") or {}
+                standby_quota_by_name = standby_scan.get("quota_by_name") or {}
+                standby_scanned_names = set(standby_probe_by_name.keys()) | set(standby_quota_by_name.keys())
+                if standby_scanned_names:
+                    self._apply_scan_maps_to_accounts(standby_scanned_names, standby_probe_by_name, standby_quota_by_name)
+
+                standby_invalid_401 = {n for n in (standby_scan.get("invalid_401") or []) if n}
+                standby_invalid_quota = {n for n in (standby_scan.get("invalid_quota") or []) if n}
+                standby_to_remove = standby_invalid_401 | standby_invalid_quota
+                if standby_to_remove:
+                    for name in standby_to_remove:
+                        if name in self.standby_names:
+                            self.standby_names.remove(name)
+                            standby_file_dirty = True
+
+                    for account in (self.all_accounts or []):
+                        name = str(account.get("name") or "").strip()
+                        if not name or name not in standby_to_remove:
+                            continue
+                        account["standby"] = False
+                        if name in standby_invalid_quota:
+                            account["disabled"] = True
+                            if account.get("raw"):
+                                account["raw"]["disabled"] = True
+                        elif name in standby_invalid_401:
+                            account["disabled"] = False
+                            if account.get("raw"):
+                                account["raw"]["disabled"] = False
+
+                remaining_need = max(0, need_count - len(picked_names))
+                if remaining_need > 0 and rt.get("auto_allow_scan_closed"):
+                    closed_candidates = self._collect_closed_candidates_from_files(files, rt, exclude_names=picked_names)
+                    closed_scan = self._scan_for_recovery(rt, closed_candidates, remaining_need)
+                    picked_names.extend(closed_scan.get("recoverable") or [])
+                    closed_scan_errors.extend(closed_scan.get("errors") or [])
+
+                    closed_probe_by_name = closed_scan.get("probe_by_name") or {}
+                    closed_quota_by_name = closed_scan.get("quota_by_name") or {}
+                    closed_scanned_names = set(closed_probe_by_name.keys()) | set(closed_quota_by_name.keys())
+                    if closed_scanned_names:
+                        self._apply_scan_maps_to_accounts(closed_scanned_names, closed_probe_by_name, closed_quota_by_name)
+
+            enabled_count = 0
+            enable_errors = []
+            if picked_names:
+                account_by_name = {}
+                for account in (self.all_accounts or []):
+                    name = str(account.get("name") or "").strip()
+                    if name:
+                        account_by_name[name] = account
+
+                enable_results = asyncio.run(
+                    enable_names(
+                        rt["base_url"],
+                        rt["token"],
+                        picked_names,
+                        rt["enable_workers"],
+                        rt["timeout"],
+                    )
+                )
+                for r in enable_results:
+                    name = r.get("name")
+                    if r.get("updated") and name:
+                        enabled_count += 1
+                        account = account_by_name.get(name)
+                        if account:
+                            account["standby"] = False
+                            account["disabled"] = False
+                            if account.get("raw"):
+                                account["raw"]["disabled"] = False
+                            account["check_error"] = None
+                        if name in self.standby_names:
+                            self.standby_names.remove(name)
+                            standby_file_dirty = True
+                    else:
+                        enable_errors.append(f"{name}: {r.get('error')}")
+
+            if standby_file_dirty:
+                try:
+                    self._save_standby_names_to_file()
+                except Exception as e:
+                    enable_errors.append(f"备用池保存失败: {e}")
+
+            files = fetch_auth_files(rt["base_url"], rt["token"], rt["timeout"])
+            final_primary = self._collect_primary_auto_candidates_from_files(files, rt)
+
+            rebalance_errors.extend(standby_scan_errors)
+            rebalance_errors.extend(closed_scan_errors)
+            rebalance_errors.extend(enable_errors)
+
+            summary["enabled_count"] = enabled_count
+            summary["active_after"] = len(final_primary)
+            summary["enforce_applied"] = True
+            summary["error_count"] = len(rebalance_errors)
+            return summary
+        except Exception as e:
+            summary["error"] = str(e)
+            return summary
 
     def _resolve_output_path(self, path_text):
         p = Path(str(path_text or "").strip() or DEFAULT_ACTIVE_QUOTA_OUTPUT)
+
+        # 相对路径统一按 config.json 所在目录解析，避免 frozen/不同启动目录导致读写不一致
+        base_dir = Path(self.config_path).resolve().parent if self.config_path else Path(HERE)
+
         if not p.is_absolute():
-            p = Path(HERE) / p
+            p = base_dir / p
         return p
+
+    def _standby_output_path(self):
+        return self._resolve_output_path(self.conf.get("standby_output") or DEFAULT_STANDBY_OUTPUT)
+
+    def _load_standby_names_from_file(self):
+        path = self._standby_output_path()
+        if not path.exists():
+            legacy = self.conf.get("standby_accounts") or []
+            if isinstance(legacy, list):
+                return {str(name).strip() for name in legacy if str(name or "").strip()}
+            return set()
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                return set()
+            return {str(name).strip() for name in data if str(name or "").strip()}
+        except Exception:
+            return set()
+
+    def _save_standby_names_to_file(self):
+        path = self._standby_output_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(sorted(self.standby_names), f, ensure_ascii=False, indent=2)
 
     def _record_active_quota_snapshot(self, scan_type):
         out_path = self._resolve_output_path(self.conf.get("active_quota_output") or DEFAULT_ACTIVE_QUOTA_OUTPUT)
@@ -1182,9 +1613,10 @@ class EnhancedUI(tk.Tk):
                         # 保留上一轮扫描得到的状态（active/error），仅当账号从未被扫描时才使用 normalized_status
                         account_status = prev.get("status") if prev.get("status") in ("active", "error") else normalized_status
 
+                    name = f.get("name") or ""
                     accounts.append(
                         {
-                            "name": f.get("name") or "",
+                            "name": name,
                             "account": f.get("account") or f.get("email") or "",
                             "status": account_status,
                             "stream_error_active": stream_error_active,
@@ -1194,7 +1626,8 @@ class EnhancedUI(tk.Tk):
                             "provider": f.get("provider"),
                             "type": get_item_type(f),
                             "disabled": bool(f.get("disabled", False)),
-                            # 保留上一轮检测结果，避免删除401后无额度标记丢失
+                            "standby": bool(name and name in self.standby_names),
+                            # 保留上一轮检测结果，避免删除401后额度耗尽标记丢失
                             "invalid_401": bool(prev.get("invalid_401", False)),
                             "invalid_quota": bool(prev.get("invalid_quota", False)),
                             "used_percent": prev.get("used_percent"),
@@ -1224,22 +1657,17 @@ class EnhancedUI(tk.Tk):
         self._apply_filter()
 
         total = len(accounts)
-        error_count = len([a for a in accounts if (a.get("status") or "").lower() == "error"])
-        active_count = len(
-            [
-                a
-                for a in accounts
-                if (a.get("status") or "").lower() == "active" or bool(a.get("stream_error_active"))
-            ]
-        )
-        unknown_count = len([a for a in accounts if (a.get("status") or "unknown").lower() in ("unknown", "")])
-        closed_count = len([a for a in accounts if bool(a.get("disabled"))])
+        error_count = len([a for a in accounts if self._status_bucket(a) == "错误"])
+        active_count = len([a for a in accounts if self._status_bucket(a) == "活跃"])
+        unknown_count = len([a for a in accounts if self._status_bucket(a) == "未知"])
+        closed_count = len([a for a in accounts if self._status_bucket(a) == "已关闭"])
+        standby_count = len([a for a in accounts if self._status_bucket(a) == "备用"])
 
         self.status.set(
-            f"加载完成: 总共={total} 错误={error_count} 活跃={active_count} 未知={unknown_count} 已关闭={closed_count}"
+            f"加载完成: 总共={total} 错误={error_count} 活跃={active_count} 未知={unknown_count} 已关闭={closed_count} 备用={standby_count}"
         )
         self.status_bar.set(
-            "双击行可切换勾选；可执行检查401/额度，关闭选中或恢复已关闭（PATCH /auth-files/status），删除选中（DELETE）。"
+            "双击行可切换勾选。支持 401 检测、额度检测、关闭/恢复以及永久删除操作。"
         )
 
     def _apply_scan_status(self, account, status_code):
@@ -1256,21 +1684,29 @@ class EnhancedUI(tk.Tk):
         account["stream_error_active"] = False
         account["_pending_scan"] = False
 
-    def _display_status(self, account):
+    def _status_bucket(self, account):
+        """统一状态桶判定，确保显示/筛选/统计使用同一规则。"""
+        if account.get("invalid_401"):
+            return "401无效"
+        if account.get("standby"):
+            return "备用"
         if account.get("disabled"):
             return "已关闭"
-        if account.get("invalid_401"):
-            return "401失效"
         if account.get("invalid_quota"):
-            return "无额度"
-        s = account.get("status") or "unknown"
-        if s == "active":
+            return "额度耗尽"
+
+        s = (account.get("status") or "unknown").lower()
+        if s == "active" or bool(account.get("stream_error_active")):
             return "活跃"
         if s == "error":
             return "错误"
         if s in ("", "unknown"):
             return "未知"
-        return str(s)
+        return str(account.get("status") or s)
+
+    def _display_status(self, account):
+        return self._status_bucket(account)
+
 
     def _display_usage(self, account):
         used_percent = account.get("used_percent")
@@ -1333,19 +1769,8 @@ class EnhancedUI(tk.Tk):
 
         filtered = []
         for account in self.all_accounts:
-            if status_filter == "错误" and account.get("status") != "error":
-                continue
-            if status_filter == "活跃" and not (
-                account.get("status") == "active" or account.get("stream_error_active")
-            ):
-                continue
-            if status_filter == "未知" and account.get("status") not in ["unknown", ""]:
-                continue
-            if status_filter == "已关闭" and not account.get("disabled"):
-                continue
-            if status_filter == "401失效" and not account.get("invalid_401"):
-                continue
-            if status_filter == "无额度" and (not account.get("invalid_quota") or account.get("disabled")):
+            bucket = self._status_bucket(account)
+            if status_filter != "全部" and bucket != status_filter:
                 continue
 
             if text_filter:
@@ -1429,6 +1854,307 @@ class EnhancedUI(tk.Tk):
     def _selected_names(self):
         return [a.get("name") for a in self.filtered_accounts if a.get("_selected") and a.get("name")]
 
+    def add_selected_to_standby(self):
+        names = self._selected_names()
+        if not names:
+            messagebox.showinfo("加入备用", "你没有选择任何账号。")
+            return
+
+        if not messagebox.askyesno(
+            "确认加入备用",
+            (
+                f"确定将选中的 {len(names)} 个账号加入备用列表吗？\n\n"
+                "加入备用后会自动关闭账号，并在定时补齐时优先从备用中恢复。"
+            ),
+        ):
+            return
+
+        self.action_progress.set(f"正在加入备用并关闭账号... 数量={len(names)}")
+
+        def worker():
+            try:
+                rt = self._runtime()
+                close_results = asyncio.run(
+                    close_names(rt["base_url"], rt["token"], names, rt["close_workers"], rt["timeout"])
+                )
+                self.after(0, self._add_standby_done, close_results)
+            except Exception as e:
+                self.after(0, messagebox.showerror, "加入备用失败", str(e))
+                self.after(0, self.action_progress.set, "加入备用失败")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _add_standby_done(self, close_results):
+        ok = [r.get("name") for r in close_results if r.get("updated") and r.get("name")]
+        bad = [r for r in close_results if not r.get("updated")]
+
+        for name in ok:
+            self.standby_names.add(name)
+
+        try:
+            self._save_standby_names_to_file()
+        except Exception as e:
+            messagebox.showwarning("加入备用结果", f"备用文件写入失败:\n{e}")
+        self._save_config()
+        self.action_progress.set(f"加入备用完成：成功={len(ok)} 失败={len(bad)}")
+
+        if bad:
+            msg = "以下账号加入备用失败：\n" + "\n".join([f"- {r.get('name')}: {r.get('error')}" for r in bad[:15]])
+            if len(bad) > 15:
+                msg += f"\n... 还有 {len(bad)-15} 条"
+            messagebox.showwarning("加入备用结果", msg)
+        else:
+            messagebox.showinfo("加入备用结果", f"已加入备用并关闭：{len(ok)} 个")
+
+        self._load_accounts()
+
+    def remove_selected_from_standby(self):
+        names = self._selected_names()
+        if not names:
+            messagebox.showinfo("移出备用", "你没有选择任何账号。")
+            return
+
+        standby_selected = [name for name in names if name in self.standby_names]
+        if not standby_selected:
+            messagebox.showinfo("移出备用", "选中账号中没有备用账号。")
+            return
+
+        if not messagebox.askyesno(
+            "确认移出备用",
+            (
+                f"将对选中的 {len(standby_selected)} 个备用账号执行 401 + 额度扫描。\n"
+                "仅状态正常且非额度耗尽账号会被开启并移出备用。\n\n"
+                "继续吗？"
+            ),
+        ):
+            return
+
+        try:
+            rt = self._runtime()
+        except Exception as e:
+            messagebox.showerror("参数错误", str(e))
+            return
+
+        candidates = []
+        for account in self.all_accounts:
+            if account.get("name") not in standby_selected:
+                continue
+            raw = account.get("raw") or {}
+            if not raw.get("auth_index"):
+                continue
+            candidates.append(raw)
+
+        if not candidates:
+            messagebox.showinfo("移出备用", "选中的备用账号缺少 auth_index，无法检测。")
+            return
+
+        self.action_progress.set(f"正在检测备用账号并尝试移出... 候选={len(candidates)}")
+
+        def worker():
+            try:
+                probe_results = asyncio.run(
+                    probe_accounts(
+                        rt["base_url"],
+                        rt["token"],
+                        candidates,
+                        rt["user_agent"],
+                        rt["chatgpt_account_id"],
+                        rt["workers"],
+                        rt["timeout"],
+                        rt["retries"],
+                    )
+                )
+                quota_results = asyncio.run(
+                    check_quota_accounts(
+                        rt["base_url"],
+                        rt["token"],
+                        candidates,
+                        rt["user_agent"],
+                        rt["chatgpt_account_id"],
+                        rt["quota_workers"],
+                        rt["timeout"],
+                        rt["retries"],
+                        rt["weekly_quota_threshold"],
+                        rt["primary_quota_threshold"],
+                    )
+                )
+
+                probe_by_name = {r.get("name"): r for r in probe_results if r.get("name")}
+                quota_by_name = {r.get("name"): r for r in quota_results if r.get("name")}
+
+                recoverable_names = []
+                for raw in candidates:
+                    name = raw.get("name")
+                    if not name:
+                        continue
+                    if self._is_recoverable_by_scan(probe_by_name.get(name), quota_by_name.get(name)):
+                        recoverable_names.append(name)
+
+                limit_meta = self._pick_names_with_active_target_limit(recoverable_names)
+                names_to_enable = list(limit_meta.get("selected") or [])
+
+                enable_results = []
+                if names_to_enable:
+                    enable_results = asyncio.run(
+                        enable_names(
+                            rt["base_url"],
+                            rt["token"],
+                            names_to_enable,
+                            rt["enable_workers"],
+                            rt["timeout"],
+                        )
+                    )
+
+                self.after(
+                    0,
+                    self._remove_standby_scan_done,
+                    standby_selected,
+                    probe_results,
+                    quota_results,
+                    enable_results,
+                    limit_meta,
+                )
+            except Exception as e:
+                self.after(0, messagebox.showerror, "移出备用失败", str(e))
+                self.after(0, self.action_progress.set, "移出备用失败")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _remove_standby_scan_done(self, standby_selected, probe_results, quota_results, enable_results, limit_meta=None):
+        probe_by_name = {r.get("name"): r for r in probe_results if r.get("name")}
+        quota_by_name = {r.get("name"): r for r in quota_results if r.get("name")}
+        enable_by_name = {r.get("name"): r for r in enable_results if r.get("name")}
+
+        selected_for_enable = set()
+        skipped_by_target_set = set()
+        if isinstance(limit_meta, dict):
+            selected_for_enable = {n for n in (limit_meta.get("selected") or []) if n}
+            skipped_by_target_set = {n for n in (limit_meta.get("skipped") or []) if n}
+
+        recoverable = 0
+        active_count = 0
+        moved_401_count = 0
+        moved_closed_count = 0
+        enable_fail = 0
+        detect_errors = 0
+
+        for name in standby_selected:
+            p = probe_by_name.get(name)
+            q = quota_by_name.get(name)
+            if self._is_recoverable_by_scan(p, q):
+                recoverable += 1
+
+        for account in self.all_accounts:
+            name = account.get("name")
+            if name not in standby_selected:
+                continue
+
+            p = probe_by_name.get(name)
+            q = quota_by_name.get(name)
+
+            invalid_401 = bool(p and p.get("invalid_401"))
+            invalid_quota = bool(q and q.get("invalid_quota"))
+
+            if p:
+                account["invalid_401"] = invalid_401
+                self._apply_scan_status(account, p.get("status_code"))
+                if p.get("error"):
+                    detect_errors += 1
+
+            if q:
+                account["invalid_quota"] = invalid_quota
+                if not p:
+                    self._apply_scan_status(account, q.get("status_code"))
+                account["used_percent"] = q.get("used_percent")
+                account["primary_used_percent"] = q.get("primary_used_percent")
+                account["primary_reset_at"] = q.get("primary_reset_at")
+                account["individual_used_percent"] = q.get("individual_used_percent")
+                account["individual_reset_at"] = q.get("individual_reset_at")
+                account["quota_source"] = q.get("quota_source")
+                account["reset_at"] = q.get("reset_at")
+                if q.get("error"):
+                    detect_errors += 1
+
+            # 默认保留在备用池；仅在实际迁移到其他列表时才移出备用池
+            account["standby"] = True
+            self.standby_names.add(name)
+
+            if invalid_401:
+                moved_401_count += 1
+                account["standby"] = False
+                self.standby_names.discard(name)
+                account["disabled"] = False
+                if account.get("raw"):
+                    account["raw"]["disabled"] = False
+                account["check_error"] = (p.get("error") if p else None) or (q.get("error") if q else None)
+                continue
+
+            if invalid_quota:
+                moved_closed_count += 1
+                account["standby"] = False
+                self.standby_names.discard(name)
+                account["disabled"] = True
+                if account.get("raw"):
+                    account["raw"]["disabled"] = True
+                account["check_error"] = (q.get("error") if q else None) or (p.get("error") if p else None)
+                continue
+
+            e = enable_by_name.get(name)
+            if e and e.get("updated"):
+                active_count += 1
+                account["standby"] = False
+                self.standby_names.discard(name)
+                account["disabled"] = False
+                if account.get("raw"):
+                    account["raw"]["disabled"] = False
+                account["check_error"] = None
+            else:
+                # 未成功开启（含因活跃目标数跳过）保持备用状态，不误转为已关闭
+                account["disabled"] = True
+                if account.get("raw"):
+                    account["raw"]["disabled"] = True
+
+                if name in selected_for_enable and name not in skipped_by_target_set:
+                    enable_fail += 1
+                    if e:
+                        account["check_error"] = e.get("error")
+                    else:
+                        account["check_error"] = (q.get("error") if q else None) or (p.get("error") if p else None)
+                elif name in skipped_by_target_set:
+                    account["check_error"] = None
+                else:
+                    account["check_error"] = None
+
+        try:
+            self._save_standby_names_to_file()
+        except Exception as e:
+            messagebox.showwarning("移出备用", f"备用文件写入失败:\n{e}")
+
+        self._save_config()
+        self._apply_filter()
+        skipped_by_target = 0
+        if isinstance(limit_meta, dict):
+            skipped_by_target = len(limit_meta.get("skipped") or [])
+
+        self.action_progress.set(f"移出备用完成：活跃={active_count} 401={moved_401_count} 已关闭={moved_closed_count}")
+
+        msg = (
+            f"选中备用: {len(standby_selected)}\n"
+            f"已检测: {max(len(probe_results), len(quota_results))}\n"
+            f"可转活跃: {recoverable}\n"
+            f"已转活跃: {active_count}\n"
+            f"转入401列表: {moved_401_count}\n"
+            f"转入已关闭列表: {moved_closed_count}\n"
+            f"开启失败: {enable_fail}\n"
+            f"检测异常: {detect_errors}"
+        )
+        if skipped_by_target > 0:
+            msg += f"\n受全局活跃目标数限制未开启: {skipped_by_target}"
+
+        messagebox.showinfo("移出备用结果", msg)
+
+        self._load_accounts()
+
     def _unknown_filter_selected(self):
         return str(self.filter_status.get() or "").strip() == "未知"
 
@@ -1440,6 +2166,8 @@ class EnhancedUI(tk.Tk):
         candidates = []
         for account in self.all_accounts:
             if account.get("disabled"):
+                continue
+            if account.get("standby"):
                 continue
 
             status = (account.get("status") or "unknown").lower()
@@ -1467,6 +2195,456 @@ class EnhancedUI(tk.Tk):
     def _quota_candidate_raw_items(self, rt, only_unknown=False):
         """额度检测默认检查活跃/未知/错误；unknown筛选时仅检查未知。"""
         return self._candidate_raw_items(rt, only_unknown=only_unknown)
+
+    def _raw_matches_target(self, raw, rt):
+        item_type = str(get_item_type(raw) or "").lower()
+        item_provider = str(raw.get("provider") or "").lower()
+
+        if rt["target_type"] and item_type != rt["target_type"]:
+            return False
+        if rt["provider"] and item_provider != rt["provider"]:
+            return False
+        if not raw.get("auth_index"):
+            return False
+        return True
+
+    def _collect_primary_auto_candidates_from_files(self, files, rt):
+        candidates = []
+        for f in files:
+            name = str(f.get("name") or "").strip()
+            if bool(f.get("disabled")):
+                continue
+            if name and name in self.standby_names:
+                continue
+
+            status = str(f.get("status") or "unknown").lower()
+            status_msg = f.get("status_message") or ""
+            if status != "active" and not _is_stream_error_active(status, status_msg):
+                continue
+            if not self._raw_matches_target(f, rt):
+                continue
+            candidates.append(f)
+        return candidates
+
+    def _collect_unknown_candidates_from_files(self, files, rt):
+        candidates = []
+        for f in files:
+            name = str(f.get("name") or "").strip()
+            if bool(f.get("disabled")):
+                continue
+            if name and name in self.standby_names:
+                continue
+
+            status = str(f.get("status") or "unknown").lower()
+            if status not in ("unknown", ""):
+                continue
+            if not self._raw_matches_target(f, rt):
+                continue
+            candidates.append(f)
+        return candidates
+
+    def _collect_standby_candidates_from_files(self, files, rt, exclude_names=None):
+        exclude_set = set(exclude_names or [])
+        candidates = []
+        for f in files:
+            name = str(f.get("name") or "").strip()
+            if not name or name not in self.standby_names:
+                continue
+            if name in exclude_set:
+                continue
+            if not self._raw_matches_target(f, rt):
+                continue
+            candidates.append(f)
+        return candidates
+
+    def _collect_closed_candidates_from_files(self, files, rt, exclude_names=None):
+        exclude_set = set(exclude_names or [])
+        candidates = []
+        for f in files:
+            name = str(f.get("name") or "").strip()
+            if not bool(f.get("disabled")):
+                continue
+            if name in self.standby_names:
+                continue
+            if name and name in exclude_set:
+                continue
+            if not self._raw_matches_target(f, rt):
+                continue
+            candidates.append(f)
+        return candidates
+
+    def _is_recoverable_by_scan(self, probe_result, quota_result):
+        if not probe_result or not quota_result:
+            return False
+        if probe_result.get("status_code") != 200:
+            return False
+        if probe_result.get("invalid_401"):
+            return False
+        if probe_result.get("error"):
+            return False
+
+        if quota_result.get("status_code") != 200:
+            return False
+        if quota_result.get("invalid_quota"):
+            return False
+        if quota_result.get("error"):
+            return False
+        return True
+
+    def _apply_scan_maps_to_accounts(self, names, probe_by_name, quota_by_name):
+        names_set = {str(n or "").strip() for n in (names or []) if str(n or "").strip()}
+        if not names_set:
+            return
+
+        for account in (self.all_accounts or []):
+            name = str(account.get("name") or "").strip()
+            if not name or name not in names_set:
+                continue
+
+            p = (probe_by_name or {}).get(name)
+            q = (quota_by_name or {}).get(name)
+
+            if p:
+                account["invalid_401"] = bool(p.get("invalid_401"))
+                self._apply_scan_status(account, p.get("status_code"))
+
+            if q:
+                account["invalid_quota"] = bool(q.get("invalid_quota"))
+                if not p:
+                    self._apply_scan_status(account, q.get("status_code"))
+                account["used_percent"] = q.get("used_percent")
+                account["primary_used_percent"] = q.get("primary_used_percent")
+                account["primary_reset_at"] = q.get("primary_reset_at")
+                account["individual_used_percent"] = q.get("individual_used_percent")
+                account["individual_reset_at"] = q.get("individual_reset_at")
+                account["quota_source"] = q.get("quota_source")
+                account["reset_at"] = q.get("reset_at")
+
+            if p or q:
+                account["check_error"] = (q.get("error") if q else None) or (p.get("error") if p else None)
+
+    def _target_scan_batch_size(self, rt):
+        try:
+            workers = max(1, int(rt.get("workers") or DEFAULT_WORKERS))
+        except Exception:
+            workers = max(1, int(DEFAULT_WORKERS))
+
+        # 活跃目标模式下严格按“并发”作为每批扫描量
+        return workers
+
+    def _scan_for_recovery(self, rt, candidates, need_count=None):
+        if not candidates:
+            return {
+                "scanned": 0,
+                "recoverable": [],
+                "invalid_401": [],
+                "invalid_quota": [],
+                "limit_only_quota": [],
+                "errors": [],
+                "probe_by_name": {},
+                "quota_by_name": {},
+            }
+
+        target_count = None
+        if need_count is not None:
+            try:
+                target_count = max(0, int(need_count))
+            except Exception:
+                target_count = 0
+            if target_count <= 0:
+                return {
+                    "scanned": 0,
+                    "recoverable": [],
+                    "invalid_401": [],
+                    "invalid_quota": [],
+                    "limit_only_quota": [],
+                    "errors": [],
+                    "probe_by_name": {},
+                    "quota_by_name": {},
+                }
+
+        recoverable_names = []
+        recoverable_set = set()
+        invalid_401_set = set()
+        invalid_quota_set = set()
+        limit_only_quota_set = set()
+        scan_errors = []
+        scanned_count = 0
+        probe_result_by_name = {}
+        quota_result_by_name = {}
+
+        if target_count is None:
+            chunk_size = max(1, min(len(candidates), max(1, rt.get("workers", 1))))
+        else:
+            batch_size = self._target_scan_batch_size(rt)
+            chunk_size = max(1, min(len(candidates), batch_size))
+
+        for i in range(0, len(candidates), chunk_size):
+            if target_count is not None and len(recoverable_names) >= target_count:
+                break
+
+            chunk = candidates[i : i + chunk_size]
+            if not chunk:
+                continue
+
+            probe_results = asyncio.run(
+                probe_accounts(
+                    rt["base_url"],
+                    rt["token"],
+                    chunk,
+                    rt["user_agent"],
+                    rt["chatgpt_account_id"],
+                    rt["workers"],
+                    rt["timeout"],
+                    rt["retries"],
+                )
+            )
+            quota_results = asyncio.run(
+                check_quota_accounts(
+                    rt["base_url"],
+                    rt["token"],
+                    chunk,
+                    rt["user_agent"],
+                    rt["chatgpt_account_id"],
+                    rt["quota_workers"],
+                    rt["timeout"],
+                    rt["retries"],
+                    rt["weekly_quota_threshold"],
+                    rt["primary_quota_threshold"],
+                )
+            )
+
+            scanned_count += len(chunk)
+
+            probe_by_name = {r.get("name"): r for r in probe_results if r.get("name")}
+            quota_by_name = {r.get("name"): r for r in quota_results if r.get("name")}
+            probe_result_by_name.update(probe_by_name)
+            quota_result_by_name.update(quota_by_name)
+
+            for r in probe_results:
+                if r.get("invalid_401") and r.get("name"):
+                    invalid_401_set.add(r.get("name"))
+                if r.get("error"):
+                    scan_errors.append(f"{r.get('name')}: {r.get('error')}")
+            for r in quota_results:
+                if r.get("invalid_quota") and r.get("name"):
+                    invalid_quota_set.add(r.get("name"))
+                    if r.get("quota_source") == "status_message":
+                        limit_only_quota_set.add(r.get("name"))
+                if r.get("error"):
+                    scan_errors.append(f"{r.get('name')}: {r.get('error')}")
+
+            for item in chunk:
+                name = item.get("name")
+                if not name or name in recoverable_set:
+                    continue
+                if self._is_recoverable_by_scan(probe_by_name.get(name), quota_by_name.get(name)):
+                    recoverable_set.add(name)
+                    recoverable_names.append(name)
+                    if target_count is not None and len(recoverable_names) >= target_count:
+                        break
+
+        if target_count is None:
+            recoverable_out = recoverable_names
+        else:
+            recoverable_out = recoverable_names[:target_count]
+
+        return {
+            "scanned": scanned_count,
+            "recoverable": recoverable_out,
+            "invalid_401": sorted(invalid_401_set),
+            "invalid_quota": sorted(invalid_quota_set),
+            "limit_only_quota": sorted(limit_only_quota_set),
+            "errors": scan_errors,
+            "probe_by_name": probe_result_by_name,
+            "quota_by_name": quota_result_by_name,
+        }
+
+    def _move_active_overflow_to_standby(self, rt, primary_candidates, target_active):
+        keep_candidates = list(primary_candidates or [])
+        overflow_candidates = []
+        if target_active >= 0 and len(keep_candidates) > target_active:
+            overflow_candidates = keep_candidates[target_active:]
+            keep_candidates = keep_candidates[:target_active]
+
+        overflow_names = []
+        for item in overflow_candidates:
+            name = str((item or {}).get("name") or "").strip()
+            if name:
+                overflow_names.append(name)
+
+        moved_names = []
+        move_errors = []
+        if overflow_names:
+            close_results = asyncio.run(
+                close_names(rt["base_url"], rt["token"], overflow_names, rt["close_workers"], rt["timeout"])
+            )
+            for r in close_results:
+                name = r.get("name")
+                if r.get("updated") and name:
+                    moved_names.append(name)
+                    self.standby_names.add(name)
+                else:
+                    move_errors.append(f"{name}: {r.get('error')}")
+
+            if moved_names:
+                try:
+                    self._save_standby_names_to_file()
+                except Exception as e:
+                    move_errors.append(f"备用池保存失败: {e}")
+
+        return {
+            "keep_candidates": keep_candidates,
+            "overflow_total": len(overflow_names),
+            "moved_to_standby": sorted({n for n in moved_names if n}),
+            "move_errors": move_errors,
+        }
+
+    def _scan_active_candidates_and_apply(self, rt, active_candidates, need_count=None):
+        if not active_candidates:
+            return {
+                "scanned": 0,
+                "active_ok": [],
+                "invalid_401": [],
+                "invalid_quota": [],
+                "actions": {"deleted": [], "closed": [], "delete_errors": [], "close_errors": []},
+                "scan_errors": [],
+            }
+
+        target_count = None
+        if need_count is not None:
+            try:
+                target_count = max(0, int(need_count))
+            except Exception:
+                target_count = 0
+            if target_count <= 0:
+                return {
+                    "scanned": 0,
+                    "active_ok": [],
+                    "invalid_401": [],
+                    "invalid_quota": [],
+                    "actions": {"deleted": [], "closed": [], "delete_errors": [], "close_errors": []},
+                    "scan_errors": [],
+                }
+
+        active_ok_names = []
+        active_ok_set = set()
+        invalid_401_set = set()
+        invalid_quota_set = set()
+        limit_only_quota_set = set()
+        scan_errors = []
+        scanned_count = 0
+
+        if target_count is None:
+            chunk_size = max(1, min(len(active_candidates), max(1, rt.get("workers", 1))))
+        else:
+            batch_size = self._target_scan_batch_size(rt)
+            chunk_size = max(1, min(len(active_candidates), batch_size))
+
+        for i in range(0, len(active_candidates), chunk_size):
+            if target_count is not None and len(active_ok_names) >= target_count:
+                break
+
+            chunk = active_candidates[i : i + chunk_size]
+            if not chunk:
+                continue
+
+            probe_results = asyncio.run(
+                probe_accounts(
+                    rt["base_url"],
+                    rt["token"],
+                    chunk,
+                    rt["user_agent"],
+                    rt["chatgpt_account_id"],
+                    rt["workers"],
+                    rt["timeout"],
+                    rt["retries"],
+                )
+            )
+            quota_results = asyncio.run(
+                check_quota_accounts(
+                    rt["base_url"],
+                    rt["token"],
+                    chunk,
+                    rt["user_agent"],
+                    rt["chatgpt_account_id"],
+                    rt["quota_workers"],
+                    rt["timeout"],
+                    rt["retries"],
+                    rt["weekly_quota_threshold"],
+                    rt["primary_quota_threshold"],
+                )
+            )
+
+            scanned_count += len(chunk)
+
+            probe_by_name = {r.get("name"): r for r in probe_results if r.get("name")}
+            quota_by_name = {r.get("name"): r for r in quota_results if r.get("name")}
+
+            for r in probe_results:
+                if r.get("invalid_401") and r.get("name"):
+                    invalid_401_set.add(r.get("name"))
+                if r.get("error"):
+                    scan_errors.append(f"{r.get('name')}: {r.get('error')}")
+
+            for r in quota_results:
+                if r.get("invalid_quota") and r.get("name"):
+                    name = r.get("name")
+                    invalid_quota_set.add(name)
+                    if r.get("quota_source") == "status_message":
+                        limit_only_quota_set.add(name)
+                if r.get("error"):
+                    scan_errors.append(f"{r.get('name')}: {r.get('error')}")
+
+            for item in chunk:
+                name = item.get("name")
+                if not name or name in active_ok_set:
+                    continue
+                if self._is_recoverable_by_scan(probe_by_name.get(name), quota_by_name.get(name)):
+                    active_ok_set.add(name)
+                    active_ok_names.append(name)
+                    if target_count is not None and len(active_ok_names) >= target_count:
+                        break
+
+        action_result = self._auto_apply_actions(
+            rt,
+            sorted(invalid_401_set),
+            sorted(invalid_quota_set),
+            sorted(limit_only_quota_set),
+        )
+
+        if target_count is None:
+            active_ok_out = active_ok_names
+        else:
+            active_ok_out = active_ok_names[:target_count]
+
+        return {
+            "scanned": scanned_count,
+            "active_ok": active_ok_out,
+            "invalid_401": sorted(invalid_401_set),
+            "invalid_quota": sorted(invalid_quota_set),
+            "actions": action_result,
+            "scan_errors": scan_errors,
+        }
+
+    def _apply_auto_401_action_only(self, rt, invalid_401_names):
+        names = sorted({n for n in (invalid_401_names or []) if n})
+        if not names:
+            return {"deleted": [], "errors": []}
+        if self.auto_401_action_var.get() != "删除":
+            return {"deleted": [], "errors": []}
+
+        deleted_names = []
+        delete_errors = []
+        delete_results = asyncio.run(
+            delete_names(rt["base_url"], rt["token"], names, rt["delete_workers"], rt["timeout"])
+        )
+        for r in delete_results:
+            if r.get("deleted"):
+                deleted_names.append(r.get("name"))
+            else:
+                delete_errors.append(f"{r.get('name')}: {r.get('error')}")
+        return {"deleted": sorted([n for n in deleted_names if n]), "errors": delete_errors}
 
     def _collect_invalid_names(self, probe_results, quota_results):
         invalid_401_names = []
@@ -1547,97 +2725,320 @@ class EnhancedUI(tk.Tk):
             return
 
         self._auto_running = True
-        self.action_progress.set("定时任务执行中：正在检测401和额度...")
+        self.action_progress.set("自动巡检执行中：正在按活跃目标补齐...")
 
         def worker():
             summary = None
             try:
                 rt = self._runtime()
                 files = fetch_auth_files(rt["base_url"], rt["token"], rt["timeout"])
-                candidates = []
-                for f in files:
-                    status = str(f.get("status") or "unknown").lower()
-                    if status not in ("active", "unknown", "error", ""):
-                        continue
 
-                    item_type = str(get_item_type(f) or "").lower()
-                    item_provider = str(f.get("provider") or "").lower()
-                    if rt["target_type"] and item_type != rt["target_type"]:
-                        continue
-                    if rt["provider"] and item_provider != rt["provider"]:
-                        continue
-                    if not f.get("auth_index"):
-                        continue
-                    candidates.append(f)
+                primary_candidates = self._collect_primary_auto_candidates_from_files(files, rt)
+                initial_active = len(primary_candidates)
+                target_active = int(rt.get("auto_keep_active_count") or 0)
 
-                if not candidates:
-                    summary = {
-                        "candidates": 0,
-                        "invalid_401": 0,
-                        "invalid_quota": 0,
-                        "deleted": [],
-                        "closed": [],
-                        "delete_errors": [],
-                        "close_errors": [],
-                        "error": None,
-                    }
-                else:
-                    probe_results = asyncio.run(
-                        probe_accounts(
+                active_scan = self._scan_active_candidates_and_apply(rt, primary_candidates, need_count=target_active)
+
+                detected_active_names = [n for n in (active_scan.get("active_ok") or []) if n]
+                detected_active_set = set(detected_active_names)
+                active_after_scan = len(detected_active_names)
+
+                active_name_order = []
+                for item in primary_candidates:
+                    name = str((item or {}).get("name") or "").strip()
+                    if name:
+                        active_name_order.append(name)
+                unscanned_active_names = [n for n in active_name_order if n not in set(detected_active_set)]
+
+                overflow_result = self._move_active_overflow_to_standby(
+                    rt,
+                    [{"name": n} for n in unscanned_active_names],
+                    0,
+                )
+
+                unknown_candidates = self._collect_unknown_candidates_from_files(files, rt)
+                unknown_scan = self._scan_for_recovery(rt, unknown_candidates, need_count=None)
+
+                unknown_invalid_401 = sorted(set(unknown_scan.get("invalid_401") or []))
+                unknown_invalid_quota = sorted(set(unknown_scan.get("invalid_quota") or []))
+                unknown_limit_only_quota = sorted(set(unknown_scan.get("limit_only_quota") or []))
+
+                unknown_action_result = self._auto_apply_actions(
+                    rt,
+                    unknown_invalid_401,
+                    unknown_invalid_quota,
+                    unknown_limit_only_quota,
+                )
+
+                deleted_unknown_set = set(unknown_action_result.get("deleted") or [])
+                closed_unknown_set = set(unknown_action_result.get("closed") or [])
+                unknown_recoverable_names = [
+                    n
+                    for n in (unknown_scan.get("recoverable") or [])
+                    if n and n not in deleted_unknown_set and n not in closed_unknown_set
+                ]
+                to_standby_names = sorted(set(unknown_recoverable_names))
+
+                unknown_standby_errors = []
+                unknown_standby_moved = []
+                if to_standby_names:
+                    close_results = asyncio.run(
+                        close_names(rt["base_url"], rt["token"], to_standby_names, rt["close_workers"], rt["timeout"])
+                    )
+                    for r in close_results:
+                        name = r.get("name")
+                        if r.get("updated") and name:
+                            unknown_standby_moved.append(name)
+                            self.standby_names.add(name)
+                        else:
+                            unknown_standby_errors.append(f"{name}: {r.get('error')}")
+
+                replenish_files = fetch_auth_files(rt["base_url"], rt["token"], rt["timeout"])
+                current_primary_candidates = self._collect_primary_auto_candidates_from_files(replenish_files, rt)
+                active_after_scan = len(current_primary_candidates)
+
+                standby_candidates = self._collect_standby_candidates_from_files(replenish_files, rt)
+                need_count = max(0, target_active - active_after_scan)
+
+                standby_scan = self._scan_for_recovery(rt, standby_candidates, need_count)
+                picked_names = list(standby_scan.get("recoverable") or [])
+
+                closed_scan = {
+                    "scanned": 0,
+                    "recoverable": [],
+                    "invalid_401": [],
+                    "invalid_quota": [],
+                    "limit_only_quota": [],
+                    "errors": [],
+                }
+                remaining_need = max(0, need_count - len(picked_names))
+                if remaining_need > 0 and rt.get("auto_allow_scan_closed"):
+                    closed_candidates = self._collect_closed_candidates_from_files(
+                        replenish_files, rt, exclude_names=picked_names
+                    )
+                    closed_scan = self._scan_for_recovery(rt, closed_candidates, need_count=remaining_need)
+                    picked_names.extend(closed_scan.get("recoverable") or [])
+
+                enabled_names = []
+                enable_errors = []
+                standby_recoverable_set = set(standby_scan.get("recoverable") or [])
+                standby_removed_by_enable = []
+                if picked_names:
+                    enable_results = asyncio.run(
+                        enable_names(
                             rt["base_url"],
                             rt["token"],
-                            candidates,
-                            rt["user_agent"],
-                            rt["chatgpt_account_id"],
-                            rt["workers"],
+                            picked_names,
+                            rt["enable_workers"],
                             rt["timeout"],
-                            rt["retries"],
                         )
                     )
-                    quota_results = asyncio.run(
-                        check_quota_accounts(
-                            rt["base_url"],
-                            rt["token"],
-                            candidates,
-                            rt["user_agent"],
-                            rt["chatgpt_account_id"],
-                            rt["quota_workers"],
-                            rt["timeout"],
-                            rt["retries"],
-                            rt["weekly_quota_threshold"],
-                            rt["primary_quota_threshold"],
+                    for r in enable_results:
+                        name = r.get("name")
+                        if r.get("updated"):
+                            if name:
+                                enabled_names.append(name)
+                            if name and name in standby_recoverable_set and name in self.standby_names:
+                                self.standby_names.remove(name)
+                                standby_removed_by_enable.append(name)
+                        else:
+                            enable_errors.append(f"{name}: {r.get('error')}")
+
+                invalid_401_all = sorted(
+                    {
+                        n
+                        for n in (
+                            (active_scan.get("invalid_401") or [])
+                            + (unknown_scan.get("invalid_401") or [])
+                            + (standby_scan.get("invalid_401") or [])
+                            + (closed_scan.get("invalid_401") or [])
                         )
-                    )
-
-                    invalid_401_names, invalid_quota_names, limit_only_quota_names = self._collect_invalid_names(
-                        probe_results, quota_results
-                    )
-                    action_result = self._auto_apply_actions(
-                        rt,
-                        invalid_401_names,
-                        invalid_quota_names,
-                        limit_only_quota_names,
-                    )
-
-                    summary = {
-                        "candidates": len(candidates),
-                        "invalid_401": len(invalid_401_names),
-                        "invalid_quota": len(invalid_quota_names),
-                        "deleted": action_result["deleted"],
-                        "closed": action_result["closed"],
-                        "delete_errors": action_result["delete_errors"],
-                        "close_errors": action_result["close_errors"],
-                        "error": None,
+                        if n
                     }
+                )
+
+                invalid_quota_all = sorted(
+                    {
+                        n
+                        for n in (
+                            (active_scan.get("invalid_quota") or [])
+                            + (unknown_scan.get("invalid_quota") or [])
+                            + (standby_scan.get("invalid_quota") or [])
+                            + (closed_scan.get("invalid_quota") or [])
+                        )
+                        if n
+                    }
+                )
+
+                processed_401 = set(active_scan.get("invalid_401") or []) | set(unknown_scan.get("invalid_401") or [])
+                extra_invalid_401 = sorted({n for n in invalid_401_all if n not in processed_401})
+                extra_401_action_result = self._apply_auto_401_action_only(rt, extra_invalid_401)
+
+                processed_quota = set(active_scan.get("invalid_quota") or []) | set(unknown_scan.get("invalid_quota") or [])
+                extra_invalid_quota = sorted({n for n in invalid_quota_all if n not in processed_quota})
+                extra_limit_only_quota = sorted(
+                    {
+                        n
+                        for n in (
+                            (standby_scan.get("limit_only_quota") or [])
+                            + (closed_scan.get("limit_only_quota") or [])
+                        )
+                        if n
+                    }
+                )
+                extra_quota_action_result = self._auto_apply_actions(
+                    rt,
+                    [],
+                    extra_invalid_quota,
+                    extra_limit_only_quota,
+                )
+
+                deleted_all = sorted(
+                    {
+                        n
+                        for n in (
+                            (active_scan.get("actions", {}).get("deleted") or [])
+                            + (unknown_action_result.get("deleted") or [])
+                            + (extra_401_action_result.get("deleted") or [])
+                            + (extra_quota_action_result.get("deleted") or [])
+                        )
+                        if n
+                    }
+                )
+
+                close_errors_all = list(active_scan.get("actions", {}).get("close_errors") or []) + list(
+                    unknown_action_result.get("close_errors") or []
+                ) + list(extra_quota_action_result.get("close_errors") or []) + list(unknown_standby_errors)
+                delete_errors_all = list(active_scan.get("actions", {}).get("delete_errors") or []) + list(
+                    unknown_action_result.get("delete_errors") or []
+                ) + list(extra_401_action_result.get("errors") or []) + list(
+                    extra_quota_action_result.get("delete_errors") or []
+                )
+
+                closed_quota_all = sorted(
+                    {
+                        n
+                        for n in (
+                            (active_scan.get("actions", {}).get("closed") or [])
+                            + (unknown_action_result.get("closed") or [])
+                            + (extra_quota_action_result.get("closed") or [])
+                        )
+                        if n
+                    }
+                )
+
+                moved_to_standby_all = sorted(
+                    {
+                        n
+                        for n in (
+                            (overflow_result.get("moved_to_standby") or [])
+                            + unknown_standby_moved
+                        )
+                        if n
+                    }
+                )
+                move_errors_all = list(overflow_result.get("move_errors") or [])
+
+                # 兜底裁剪，确保最终活跃数不超过目标
+                final_files_before_trim = fetch_auth_files(rt["base_url"], rt["token"], rt["timeout"])
+                final_primary_before_trim = self._collect_primary_auto_candidates_from_files(final_files_before_trim, rt)
+                trim_result = {"overflow_total": 0, "moved_to_standby": [], "move_errors": []}
+                if target_active >= 0 and len(final_primary_before_trim) > target_active:
+                    trim_result = self._move_active_overflow_to_standby(rt, final_primary_before_trim, target_active)
+                    moved_to_standby_all = sorted(
+                        {
+                            n
+                            for n in (moved_to_standby_all + (trim_result.get("moved_to_standby") or []))
+                            if n
+                        }
+                    )
+                    move_errors_all += list(trim_result.get("move_errors") or [])
+
+                final_files = fetch_auth_files(rt["base_url"], rt["token"], rt["timeout"])
+                active_after_scan = len(self._collect_primary_auto_candidates_from_files(final_files, rt))
+
+                standby_file_dirty = bool(unknown_standby_moved) or bool(standby_removed_by_enable)
+                deleted_set = set(deleted_all)
+                if deleted_set:
+                    removed_deleted = [name for name in list(self.standby_names) if name in deleted_set]
+                    if removed_deleted:
+                        for name in removed_deleted:
+                            self.standby_names.discard(name)
+                        standby_file_dirty = True
+
+                closed_set = set(closed_quota_all)
+                if closed_set:
+                    removed_closed = [name for name in list(self.standby_names) if name in closed_set]
+                    if removed_closed:
+                        for name in removed_closed:
+                            self.standby_names.discard(name)
+                        standby_file_dirty = True
+
+                if standby_file_dirty:
+                    try:
+                        self._save_standby_names_to_file()
+                    except Exception as e:
+                        move_errors_all.append(f"备用池保存失败: {e}")
+
+                summary = {
+                    "target_active": target_active,
+                    "initial_active": initial_active,
+                    "active_scanned": active_scan.get("scanned", 0),
+                    "active_after_scan": active_after_scan,
+                    "need_count": max(0, target_active - active_after_scan),
+                    "standby_candidates": len(standby_candidates),
+                    "standby_scanned": standby_scan.get("scanned", 0),
+                    "closed_scanned": closed_scan.get("scanned", 0),
+                    "picked_count": len(picked_names),
+                    "enabled": sorted([n for n in enabled_names if n]),
+                    "enable_errors": enable_errors,
+                    "invalid_401": len(invalid_401_all),
+                    "deleted_401": deleted_all,
+                    "closed_quota": closed_quota_all,
+                    "delete_errors": delete_errors_all,
+                    "close_errors": close_errors_all,
+                    "overflow_total": len(unscanned_active_names) + int(trim_result.get("overflow_total") or 0),
+                    "moved_to_standby": moved_to_standby_all,
+                    "move_errors": move_errors_all,
+                    "unknown_candidates": len(unknown_candidates),
+                    "unknown_scanned": unknown_scan.get("scanned", 0),
+                    "unknown_recoverable": len(unknown_recoverable_names),
+                    "unknown_standby_moved": len(unknown_standby_moved),
+                    "scan_errors": (
+                        list(active_scan.get("scan_errors") or [])
+                        + list(unknown_scan.get("errors") or [])
+                        + list(standby_scan.get("errors") or [])
+                        + list(closed_scan.get("errors") or [])
+                    ),
+                    "error": None,
+                }
+
             except Exception as e:
                 summary = {
-                    "candidates": 0,
+                    "target_active": 0,
+                    "initial_active": 0,
+                    "active_scanned": 0,
+                    "active_after_scan": 0,
+                    "need_count": 0,
+                    "standby_candidates": 0,
+                    "standby_scanned": 0,
+                    "closed_scanned": 0,
+                    "picked_count": 0,
+                    "enabled": [],
+                    "enable_errors": [],
                     "invalid_401": 0,
-                    "invalid_quota": 0,
-                    "deleted": [],
-                    "closed": [],
+                    "deleted_401": [],
+                    "closed_quota": [],
                     "delete_errors": [],
                     "close_errors": [],
+                    "overflow_total": 0,
+                    "moved_to_standby": [],
+                    "move_errors": [],
+                    "unknown_candidates": 0,
+                    "unknown_scanned": 0,
+                    "unknown_recoverable": 0,
+                    "unknown_standby_moved": 0,
+                    "scan_errors": [],
                     "error": str(e),
                 }
 
@@ -1649,27 +3050,53 @@ class EnhancedUI(tk.Tk):
         self._auto_running = False
 
         if summary.get("error"):
-            self.auto_status_var.set(f"定时任务失败：{summary.get('error')}")
-            self.action_progress.set("定时任务失败")
+            self.auto_status_var.set(f"自动巡检失败：{summary.get('error')}")
+            self.action_progress.set("自动巡检失败")
         else:
             self.auto_status_var.set(
-                "定时任务已执行："
-                f"候选={summary.get('candidates')} 401={summary.get('invalid_401')} "
-                f"无额度={summary.get('invalid_quota')} 删除={len(summary.get('deleted', []))} "
-                f"关闭={len(summary.get('closed', []))}"
+                "自动巡检已开启："
+                f"活跃初始={summary.get('initial_active')} "
+                f"活跃扫描={summary.get('active_scanned')} "
+                f"活跃可用={summary.get('active_after_scan')} "
+                f"补齐={len(summary.get('enabled', []))} "
+                f"转备用={len(summary.get('moved_to_standby', []))} "
+                f"未知扫描={summary.get('unknown_scanned')}/{summary.get('unknown_candidates')} "
+                f"未知入备用={summary.get('unknown_standby_moved')} "
+                f"本轮401={summary.get('invalid_401')}"
             )
-            self.action_progress.set("定时任务执行完成")
+            self.action_progress.set("自动巡检执行完成")
 
             error_lines = []
+            if summary.get("enable_errors"):
+                error_lines.append("开启失败:\n" + "\n".join(summary.get("enable_errors")[:10]))
             if summary.get("delete_errors"):
-                error_lines.append("删除失败:\n" + "\n".join(summary.get("delete_errors")[:10]))
+                error_lines.append("删除401失败:\n" + "\n".join(summary.get("delete_errors")[:10]))
             if summary.get("close_errors"):
                 error_lines.append("关闭失败:\n" + "\n".join(summary.get("close_errors")[:10]))
+            if summary.get("move_errors"):
+                error_lines.append("转入备用失败:\n" + "\n".join(summary.get("move_errors")[:10]))
+            if summary.get("scan_errors"):
+                error_lines.append("扫描异常:\n" + "\n".join(summary.get("scan_errors")[:10]))
             if error_lines:
-                messagebox.showwarning("定时任务部分失败", "\n\n".join(error_lines))
+                messagebox.showwarning("自动巡检部分失败", "\n\n".join(error_lines))
 
         self._load_accounts()
         self._schedule_next_auto_check()
+        self._refresh_auto_toggle_button()
+
+    def _refresh_auto_toggle_button(self):
+        try:
+            self.auto_toggle_btn.configure(
+                text="停止自动巡检" if self.auto_enabled_var.get() else "启动自动巡检"
+            )
+        except Exception:
+            pass
+
+    def toggle_auto_check(self):
+        if self.auto_enabled_var.get():
+            self.stop_auto_check()
+        else:
+            self.start_auto_check()
 
     def _schedule_next_auto_check(self):
         if self._auto_job is not None:
@@ -1682,11 +3109,11 @@ class EnhancedUI(tk.Tk):
         try:
             interval_minutes = int(self.auto_interval_var.get() or 0)
         except Exception:
-            self.auto_status_var.set("定时任务参数错误：间隔分钟必须为整数")
+            self.auto_status_var.set("自动巡检参数错误：间隔分钟必须为整数")
             return
 
         if interval_minutes <= 0:
-            self.auto_status_var.set("定时任务参数错误：间隔分钟必须大于0")
+            self.auto_status_var.set("自动巡检参数错误：间隔分钟必须大于0")
             return
 
         self._auto_job = self.after(interval_minutes * 60 * 1000, self._run_scheduled_check_once)
@@ -1695,9 +3122,11 @@ class EnhancedUI(tk.Tk):
         self.auto_enabled_var.set(True)
         self._save_config()
         self._schedule_next_auto_check()
+        self._refresh_auto_toggle_button()
         self.auto_status_var.set(
-            f"定时任务已启动：每 {self.auto_interval_var.get()} 分钟执行一次，"
-            f"401->{self.auto_401_action_var.get()}，无额度->{self.auto_quota_action_var.get()}"
+            f"自动巡检已开启：每 {self.auto_interval_var.get()} 分钟执行一次，"
+            f"允许扫描已关闭={'是' if self.auto_allow_closed_scan_var.get() else '否'}，"
+            f"401处理={self.auto_401_action_var.get()}"
         )
         self._run_scheduled_check_once()
 
@@ -1707,10 +3136,11 @@ class EnhancedUI(tk.Tk):
             self.after_cancel(self._auto_job)
             self._auto_job = None
         self._save_config()
-        self.auto_status_var.set("定时任务：已停止")
+        self._refresh_auto_toggle_button()
+        self.auto_status_var.set("自动巡检：已停止")
 
     def check_401(self):
-        if not self._ensure_accounts_loaded("检查401"):
+        if not self._ensure_accounts_loaded("检测 401 失效"):
             return
         try:
             rt = self._runtime()
@@ -1722,12 +3152,12 @@ class EnhancedUI(tk.Tk):
         candidates = self._candidate_raw_items(rt, only_unknown=only_unknown)
         if not candidates:
             if only_unknown:
-                messagebox.showinfo("检查401", "当前筛选为“未知”，没有符合条件（未知、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
+                messagebox.showinfo("检测 401 失效", "当前筛选为“未知”，没有符合条件（未知、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
             else:
-                messagebox.showinfo("检查401", "没有符合条件（活跃/未知/错误、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
+                messagebox.showinfo("检测 401 失效", "没有符合条件（活跃/未知/错误、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
             return
 
-        self.action_progress.set(f"正在检查401... 候选={len(candidates)}")
+        self.action_progress.set(f"正在检测 401 失效... 候选={len(candidates)}")
 
         def worker():
             try:
@@ -1748,8 +3178,8 @@ class EnhancedUI(tk.Tk):
                     json.dump(invalid_401, f, ensure_ascii=False, indent=2)
                 self.after(0, self._check_401_done, results, rt["output"])
             except Exception as e:
-                self.after(0, messagebox.showerror, "401检测失败", str(e))
-                self.after(0, self.action_progress.set, "401检测失败")
+                self.after(0, messagebox.showerror, "401 检测失败", str(e))
+                self.after(0, self.action_progress.set, "401 检测失败")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1772,10 +3202,18 @@ class EnhancedUI(tk.Tk):
 
         snapshot = self._record_active_quota_snapshot("401")
 
+        rebalance_summary = None
+        try:
+            rt = self._runtime()
+            rebalance_summary = self._rebalance_active_target_by_runtime(rt)
+        except Exception as e:
+            rebalance_summary = {"error": str(e)}
+
+        self._load_accounts()
         self._apply_filter()
-        self.action_progress.set(f"401检测完成：失效={invalid_count} 异常={error_count}")
+        self.action_progress.set(f"401 检测完成：无效={invalid_count} 异常={error_count}")
         msg = (
-            f"401失效: {invalid_count}\n"
+            f"401无效: {invalid_count}\n"
             f"检测异常: {error_count}\n"
             f"导出文件: {output_path}\n"
             f"活跃额度记录: {snapshot.get('count', 0)} 条\n"
@@ -1783,7 +3221,20 @@ class EnhancedUI(tk.Tk):
         )
         if snapshot.get("error"):
             msg += f"\n记录失败: {snapshot.get('error')}"
-        messagebox.showinfo("401检测完成", msg)
+        if rebalance_summary:
+            if rebalance_summary.get("error"):
+                msg += f"\n全局活跃目标平衡失败: {rebalance_summary.get('error')}"
+            elif rebalance_summary.get("enforce_applied"):
+                msg += (
+                    f"\n活跃目标平衡: 目标={rebalance_summary.get('target_active')}"
+                    f"，扫描后活跃={rebalance_summary.get('active_before')}"
+                    f"，转备用={rebalance_summary.get('moved_to_standby_count')}"
+                    f"，从池补齐={rebalance_summary.get('enabled_count')}"
+                    f"，平衡后活跃={rebalance_summary.get('active_after')}"
+                )
+            elif rebalance_summary.get("enforce_skipped"):
+                msg += "\n活跃目标平衡: 已跳过（活跃账号目标数<=0 视为不限制）"
+        messagebox.showinfo("401 检测完成", msg)
 
     def check_quota(self):
         if not self._ensure_accounts_loaded("额度检测"):
@@ -1803,7 +3254,7 @@ class EnhancedUI(tk.Tk):
                 messagebox.showinfo("额度检测", "没有符合条件（活跃/未知/错误、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
             return
 
-        self.action_progress.set(f"正在检查额度... 候选={len(candidates)}")
+        self.action_progress.set(f"正在检测额度状态... 候选={len(candidates)}")
 
         def worker():
             try:
@@ -1857,15 +3308,36 @@ class EnhancedUI(tk.Tk):
 
         snapshot = self._record_active_quota_snapshot("quota")
 
+        rebalance_summary = None
+        try:
+            rt = self._runtime()
+            rebalance_summary = self._rebalance_active_target_by_runtime(rt)
+        except Exception as e:
+            rebalance_summary = {"error": str(e)}
+
+        self._load_accounts()
         self._apply_filter()
-        self.action_progress.set(f"额度检测完成：无额度={quota_count} 异常={error_count}")
-        msg = f"无额度: {quota_count}\n检测异常: {error_count}\n导出文件: {output_path}\n活跃额度记录: {snapshot.get('count', 0)} 条\n记录文件: {snapshot.get('path')}"
+        self.action_progress.set(f"额度检测完成：额度耗尽={quota_count} 异常={error_count}")
+        msg = f"额度耗尽: {quota_count}\n检测异常: {error_count}\n导出文件: {output_path}\n活跃额度记录: {snapshot.get('count', 0)} 条\n记录文件: {snapshot.get('path')}"
         if snapshot.get("error"):
             msg += f"\n记录失败: {snapshot.get('error')}"
+        if rebalance_summary:
+            if rebalance_summary.get("error"):
+                msg += f"\n全局活跃目标平衡失败: {rebalance_summary.get('error')}"
+            elif rebalance_summary.get("enforce_applied"):
+                msg += (
+                    f"\n活跃目标平衡: 目标={rebalance_summary.get('target_active')}"
+                    f"，扫描后活跃={rebalance_summary.get('active_before')}"
+                    f"，转备用={rebalance_summary.get('moved_to_standby_count')}"
+                    f"，从池补齐={rebalance_summary.get('enabled_count')}"
+                    f"，平衡后活跃={rebalance_summary.get('active_after')}"
+                )
+            elif rebalance_summary.get("enforce_skipped"):
+                msg += "\n活跃目标平衡: 已跳过（活跃账号目标数<=0 视为不限制）"
         messagebox.showinfo("额度检测完成", msg)
 
     def check_both(self):
-        if not self._ensure_accounts_loaded("联合检测"):
+        if not self._ensure_accounts_loaded("联合检测（401+额度）"):
             return
         try:
             rt = self._runtime()
@@ -1877,12 +3349,12 @@ class EnhancedUI(tk.Tk):
         candidates = self._candidate_raw_items(rt, only_unknown=only_unknown)
         if not candidates:
             if only_unknown:
-                messagebox.showinfo("联合检测", "当前筛选为“未知”，没有符合条件（未知、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
+                messagebox.showinfo("联合检测（401+额度）", "当前筛选为“未知”，没有符合条件（未知、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
             else:
-                messagebox.showinfo("联合检测", "没有符合条件（活跃/未知/错误、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
+                messagebox.showinfo("联合检测（401+额度）", "没有符合条件（活跃/未知/错误、未关闭、匹配 target_type/provider 且带 auth_index）的账号可检测。")
             return
 
-        self.action_progress.set(f"正在联合检测... 候选={len(candidates)}")
+        self.action_progress.set(f"正在联合检测（401+额度）... 候选={len(candidates)}")
 
         def worker():
             try:
@@ -1923,8 +3395,8 @@ class EnhancedUI(tk.Tk):
 
                 self.after(0, self._check_both_done, probe_results, quota_results, rt["output"], rt["quota_output"])
             except Exception as e:
-                self.after(0, messagebox.showerror, "联合检测失败", str(e))
-                self.after(0, self.action_progress.set, "联合检测失败")
+                self.after(0, messagebox.showerror, "联合检测（401+额度）失败", str(e))
+                self.after(0, self.action_progress.set, "联合检测（401+额度）失败")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1969,11 +3441,19 @@ class EnhancedUI(tk.Tk):
 
         snapshot = self._record_active_quota_snapshot("both")
 
+        rebalance_summary = None
+        try:
+            rt = self._runtime()
+            rebalance_summary = self._rebalance_active_target_by_runtime(rt)
+        except Exception as e:
+            rebalance_summary = {"error": str(e)}
+
+        self._load_accounts()
         self._apply_filter()
-        self.action_progress.set(f"联合检测完成：401={count_401} 无额度={count_quota}")
+        self.action_progress.set(f"联合检测（401+额度）完成：401={count_401} 额度耗尽={count_quota}")
         msg = (
-            f"401失效: {count_401}\n"
-            f"无额度: {count_quota}\n"
+            f"401无效: {count_401}\n"
+            f"额度耗尽: {count_quota}\n"
             f"检测异常: {count_err}\n"
             f"401导出: {output_path}\n"
             f"额度导出: {quota_output_path}\n"
@@ -1982,7 +3462,20 @@ class EnhancedUI(tk.Tk):
         )
         if snapshot.get("error"):
             msg += f"\n记录失败: {snapshot.get('error')}"
-        messagebox.showinfo("联合检测完成", msg)
+        if rebalance_summary:
+            if rebalance_summary.get("error"):
+                msg += f"\n全局活跃目标平衡失败: {rebalance_summary.get('error')}"
+            elif rebalance_summary.get("enforce_applied"):
+                msg += (
+                    f"\n活跃目标平衡: 目标={rebalance_summary.get('target_active')}"
+                    f"，扫描后活跃={rebalance_summary.get('active_before')}"
+                    f"，转备用={rebalance_summary.get('moved_to_standby_count')}"
+                    f"，从池补齐={rebalance_summary.get('enabled_count')}"
+                    f"，平衡后活跃={rebalance_summary.get('active_after')}"
+                )
+            elif rebalance_summary.get("enforce_skipped"):
+                msg += "\n活跃目标平衡: 已跳过（活跃账号目标数<=0 视为不限制）"
+        messagebox.showinfo("联合检测（401+额度）完成", msg)
 
     def close_selected(self):
         names = self._selected_names()
@@ -2061,7 +3554,7 @@ class EnhancedUI(tk.Tk):
             "确认恢复",
             (
                 f"将检测 {len(candidates)} 个已关闭账号的额度与状态（含401/其他错误）。\n"
-                "仅当状态正常且不满足“无额度”条件时，才会自动开启这些账号。\n\n"
+                "仅当状态正常且不满足“额度耗尽”条件时，才会自动开启这些账号。\n\n"
                 "继续吗？"
             ),
         ):
@@ -2113,6 +3606,9 @@ class EnhancedUI(tk.Tk):
 
                 names_to_enable = [r.get("name") for r in recoverable if r.get("name")]
 
+                limit_meta = self._pick_names_with_active_target_limit(names_to_enable)
+                names_to_enable = list(limit_meta.get("selected") or [])
+
                 enable_results = []
                 if names_to_enable:
                     enable_results = asyncio.run(
@@ -2125,14 +3621,14 @@ class EnhancedUI(tk.Tk):
                         )
                     )
 
-                self.after(0, self._recover_closed_done, probe_results, quota_results, enable_results)
+                self.after(0, self._recover_closed_done, probe_results, quota_results, enable_results, limit_meta)
             except Exception as e:
                 self.after(0, messagebox.showerror, "恢复失败", str(e))
                 self.after(0, self.action_progress.set, "恢复失败")
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _recover_closed_done(self, probe_results, quota_results, enable_results):
+    def _recover_closed_done(self, probe_results, quota_results, enable_results, limit_meta=None):
         probe_by_name = {r.get("name"): r for r in probe_results if r.get("name")}
         quota_by_name = {r.get("name"): r for r in quota_results if r.get("name")}
         enable_by_name = {r.get("name"): r for r in enable_results if r.get("name")}
@@ -2206,18 +3702,23 @@ class EnhancedUI(tk.Tk):
         self._apply_filter()
         self.action_progress.set(f"恢复流程完成：开启成功={enabled_ok} 失败={enabled_fail}")
 
-        messagebox.showinfo(
-            "恢复已关闭结果",
-            (
-                f"已关闭检测: {checked}\n"
-                f"状态正常且额度恢复(可开启): {recoverable}\n"
-                f"401失效: {invalid_401_count}\n"
-                f"其他状态异常: {other_status_count}\n"
-                f"开启成功: {enabled_ok}\n"
-                f"开启失败: {enabled_fail}\n"
-                f"检测异常: {detect_errors}"
-            ),
+        skipped_by_target = 0
+        if isinstance(limit_meta, dict):
+            skipped_by_target = len(limit_meta.get("skipped") or [])
+
+        msg = (
+            f"已关闭检测: {checked}\n"
+            f"状态正常且额度恢复(可开启): {recoverable}\n"
+            f"401无效: {invalid_401_count}\n"
+            f"其他状态异常: {other_status_count}\n"
+            f"开启成功: {enabled_ok}\n"
+            f"开启失败: {enabled_fail}\n"
+            f"检测异常: {detect_errors}"
         )
+        if skipped_by_target > 0:
+            msg += f"\n受全局活跃目标数限制未开启: {skipped_by_target}"
+
+        messagebox.showinfo("恢复已关闭结果", msg)
 
         self._load_accounts()
 
