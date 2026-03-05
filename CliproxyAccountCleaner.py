@@ -745,7 +745,7 @@ async def delete_names(base_url, token, names, delete_workers, timeout):
 class EnhancedUI(tk.Tk):
     def __init__(self, conf, config_path):
         super().__init__()
-        self.title("CliproxyAccountCleaner v1.3.2")
+        self.title("CliproxyAccountCleaner v1.3.3")
         self.geometry("1220x760")
         self.minsize(1080, 640)
 
@@ -1060,6 +1060,7 @@ class EnhancedUI(tk.Tk):
         ttk.Label(help_card, text="5) 先执行“检测401无效 / 检测额度 / 联合检测”，再进行关闭、恢复、删除。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Label(help_card, text="6) 401无效账号推荐删除 / 无额度账号推荐关闭 / 其他普通报错账号默认按活跃展示", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Label(help_card, text="7) 可用关键词+状态筛选；双击表格行可勾选/取消勾选。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x", pady=(0, 8))
+        ttk.Label(help_card, text="8) 当前默认只操作codex账号，其他类型账号会扫描但不会操作，可以手动操作。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x", pady=(0, 8))
 
         ttk.Separator(help_card, orient="horizontal").pack(fill="x", pady=(2, 8))
 
@@ -1076,7 +1077,7 @@ class EnhancedUI(tk.Tk):
 
         ttk.Label(help_card, text="三、备用池说明", style="Header.TLabel").pack(anchor="w", pady=(0, 6))
         ttk.Label(help_card, text="- 加入备用池：将选中账号加入备用列表，并立即关闭账号。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
-        ttk.Label(help_card, text="- 移出备用池：会先做 401+额度检测，仅“状态正常且非额度耗尽”的账号会开启并移入活跃账号池，并且移出备用池。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
+        ttk.Label(help_card, text="- 备用转活跃：会先做 401+额度检测，仅“状态正常且非额度耗尽”的账号会开启并移入活跃账号池，并且移出备用池。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x")
         ttk.Label(help_card, text="- 自动补齐活跃账号时，系统会优先从备用池挑选可恢复账号。", style="Subtle.TLabel", justify="left", wraplength=1060).pack(anchor="w", fill="x", pady=(0, 8))
 
         ttk.Separator(help_card, orient="horizontal").pack(fill="x", pady=(2, 8))
@@ -1660,8 +1661,10 @@ class EnhancedUI(tk.Tk):
 
     def _resolve_output_path(self, path_text):
         p = Path(str(path_text or "").strip() or DEFAULT_ACTIVE_QUOTA_OUTPUT)
+        # 相对路径统一按 config.json 所在目录解析，避免 frozen/不同启动目录导致读写不一致
+        base_dir = Path(self.config_path).resolve().parent if self.config_path else Path(HERE)
         if not p.is_absolute():
-            p = Path(HERE) / p
+            p = base_dir / p
         return p
 
     def _standby_output_path(self):
@@ -3233,7 +3236,6 @@ class EnhancedUI(tk.Tk):
 
         def worker():
             summary = None
-            run_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             try:
                 files = fetch_auth_files(rt["base_url"], rt["token"], rt["timeout"])
 
@@ -3500,7 +3502,6 @@ class EnhancedUI(tk.Tk):
                 )
 
                 summary = {
-                    "run_id": run_id,
                     "target_active": target_active,
                     "initial_active": initial_active,
                     "active_scanned": active_scan.get("scanned", 0),
@@ -3597,12 +3598,10 @@ class EnhancedUI(tk.Tk):
             target_active = int(summary.get("target_active") or 0)
             active_observed = int(summary.get("active_observed") or summary.get("active_after_scan") or 0)
             gap_to_target = int(summary.get("gap_to_target") or 0)
-            run_id = str(summary.get("run_id") or "-")
             merge_conflict_count = int(summary.get("merge_conflict_count") or 0)
 
             self.auto_status_var.set(
                 "自动巡检已开启："
-                f"轮次={run_id} "
                 f"一致性={state_label} "
                 f"目标={target_active} "
                 f"后台回读活跃={active_observed} "
