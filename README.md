@@ -1,125 +1,203 @@
-## **最新v1.3.3版本：（账号多，一定要更新这版本）**
-本次版本重点更新两项能力：活跃账号目标数 与 备用池机制，用于更稳定地控制在线账号数量并提升补位效率。
-
-### 活跃账号目标数（全局参数）
-新增全局“活跃账号目标数”控制，在cpa中只开启一定数量的账号！降低服务器压力！（很多朋友想要的功能），并且开启自动巡检后，会自动删除失效账号，关闭无额度账号，自动从备用池以及已关闭账号中扫描补齐可用账号！只需设置低参数的并发，低占用性能就可以完美的失效无人监管！
-
-在自动巡检、检测、移出备用、恢复已关闭等涉及“开启账号”的流程中统一生效。
-当活跃账号超出目标时，系统会自动回收到备用池；不足时自动补齐。
-
-### **备用池机制**
-支持将账号手动加入/移出备用池。
-加入备用池后会自动关闭账号，不参与主流程。
-移出备用池时会先进行 401 + 额度检测，仅状态正常且非额度耗尽账号会恢复为活跃。
-自动补齐活跃账号时，优先从备用池恢复可用账号。
-
-### 补齐策略增强
-新增“不足时允许从已关闭账号补齐”选项：当备用池不足时，自动继续扫描已关闭账号进行补位。
-补齐过程遵循目标数限制，避免超额开启。
-行为说明：
-活跃目标数 <= 0 时，视为不限制活跃数量。
-列表显示状态优先级统一为：
-401无效 > 备用 > 已关闭 > 额度耗尽 > 活跃 > 错误 > 未知
-
 # CliproxyAccountCleaner
 
-一个用于 CLIProxy 管理端的批量账号检测与处理工具（当前主要面向 Codex 账号）。
+基于 CLIProxy 管理端的账号巡检与批量处理工具。  
+当前支持桌面模式（Tk）和网页模式（推荐），并已支持 Docker 部署。
 
-## 💡 为什么你需要这个工具？
+## 1. 当前能力概览
 
-如果你正在使用 Cliproxy 管理大量 ChatGPT 账号，相信你一定会遇到这些痛点：
+### 1.1 检测能力
+- 401 无效检测
+- 额度检测（周额度 + 5 小时额度阈值）
+- 联合检测（401 + 额度）
 
-- 🔍 **手动检测效率低**：一个个检查账号状态，耗时又容易出错
-- 📊 **额度管理混乱**：不知道哪些账号额度即将耗尽
-- 🔄 **状态维护困难**：关闭、开启、删除操作繁琐
-- ⏰ **无法实时监控**：需要人工定时巡检，容易遗漏
+### 1.2 批量动作
+- 关闭选中账号
+- 恢复已关闭账号
+- 永久删除账号
+- 加入备用池
+- 备用转活跃（先检测后开启）
 
-**CliproxyAccountCleaner 就是为解决这些问题而生！**
+### 1.3 自动巡检
+- 按间隔循环执行检测
+- 可配置 401 账号处理策略（删除/仅标记）
+- 可配置额度耗尽处理策略（关闭/删除/仅标记）
+- 可配置活跃账号目标数（超出回收，不足补齐）
+- 补齐顺序：备用池优先，可选从已关闭池补齐
 
-## ✨ 核心功能亮点
+### 1.4 网页登录与会话
+- 新增登录页（账号密码）
+- 登录凭据从 `config.json` 读取，不再硬编码
+- 会话 Cookie（HttpOnly + SameSite=Lax）
+- 支持退出登录
+- 配置字段缺失时自动补齐为免登录（默认登录态）
 
-### 🎯 智能检测系统
-- **401 无效检测**：自动识别认证失效账号，支持重试避免误判
-- **额度监控**：周额度 + 5小时额度双重检测，阈值可自定义
-- **联合扫描**：401+额度一次性检测，效率翻倍
-* **允许只打开一定数量的活跃账号**： 降低服务器压力，上号、删除、关闭等操作
-* 
-### 🔧 批量管理工具
-- **一键关闭/开启**：批量操作，省时省力
-- **永久删除**：危险操作二次确认，安全可靠
-- **备用池管理**：智能分类，灵活调度
+## 2. 目录结构
 
-### 🤖 自动化巡检
-- **定时任务**：可配置巡检间隔，解放双手
-- **智能处理**：401账号自动删除，额度耗尽自动关闭
-- **活跃平衡**：自动维持目标活跃账号数量
-
-## 功能概览
-
-- 拉取管理端 `auth-files` 账号列表
-- 批量检查 401 失效状态
-- 批量检查额度状态（周额度 + 5 小时额度）
-- 批量关闭、恢复、删除账号
-- 支持定时检测与自动动作
-
-## 运行环境
-
-- Windows 10 / 11（推荐直接使用 `.exe`）
-- 或者任意可运行 Python 的环境（源码运行）
-- 可访问 CLIProxy 管理地址
-
-## 配置说明（config.json）
-
-请先编辑同目录下 `config.json`：
-
-- `base_url`：管理端地址（例如 `http://127.0.0.1:2083`）
-- `token` 或 `cpa_password`：管理令牌（当前代码会兼容这两个字段）
-
-> 建议只维护 `token` 字段，`cpa_password` 主要用于兼容历史配置。
-
-## 使用方式
-
-### 方式 A：可执行文件（推荐）
-
-1. 下载并解压 Release 中的 `CliproxyAccountCleaner.zip`
-2. 修改 `config.json`
-3. 双击运行 `CliproxyAccountCleaner.exe`
-
-### 方式 B：源码运行
-
-```bash
-python CliproxyAccountCleaner.py
+```text
+CliproxyAccountCleaner.py     # 主入口（默认网页模式）
+cliproxy_web_mode.py          # 网页端逻辑（单文件）
+config.json                   # 运行配置（含登录配置）
+Dockerfile                    # Docker 镜像构建
+docker-compose.yml            # Docker Compose 启动
+.dockerignore
 ```
 
-## 常见操作流程
+## 3. 快速开始（本地）
 
-1. 点击“刷新”加载账号
-2. 点击“检查401”或“检查额度”
-3. 按结果执行“关闭选中 / 恢复已关闭 / 永久删除”
+### 3.1 依赖
 
-## 打包文件说明
+- Python 3.10+
+- `requests`
+- `aiohttp`
 
-发布压缩包通常包含：
+安装：
 
-- `CliproxyAccountCleaner.exe`
-- `config.json`
-- `请读我.txt`
+```bash
+pip install requests aiohttp
+```
 
-## 使用建议
+### 3.2 启动网页模式（推荐）
 
-- 删除前务必二次确认（删除不可恢复）
-- 先检测，再批量处理
-- 不要公开分享包含真实令牌的 `config.json`
+```bash
+python CliproxyAccountCleaner.py --host 127.0.0.1 --port 8765 --no-browser
+```
 
-### **请求打赏10LDC:**
-https://credit.linux.do/paying/online?token=0a1672d8210f616307549945132ac09489624ff61e81f67c0e23376df72bc37e
+浏览器访问：
 
-## 合规与免责声明
+```text
+http://127.0.0.1:8765
+```
 
-本工具仅用于运维与测试场景。请确保你的使用行为符合目标平台条款及当地法律法规。
+### 3.3 启动桌面模式（可选）
 
-**本软件为免费软件，请勿出售，如果在其他地方购买，请申请退款。**
+```bash
+python CliproxyAccountCleaner.py --desktop
+```
 
+注意：桌面模式需要 `tkinter` 运行时。无 `tkinter` 环境下请使用网页模式。
 
+## 4. Docker 部署
 
+## 4.1 使用 `docker compose`（推荐）
+
+```bash
+docker compose up -d --build
+```
+
+默认映射：
+- `8765:8765`
+
+访问：
+
+```text
+http://127.0.0.1:8765
+```
+
+停止：
+
+```bash
+docker compose down
+```
+
+## 4.2 纯 `docker` 命令
+
+构建：
+
+```bash
+docker build -t cliproxy-account-cleaner:latest .
+```
+
+启动：
+
+```bash
+docker run -d \
+  --name cliproxy-account-cleaner \
+  -p 8765:8765 \
+  -v %cd%/config.json:/app/config.json \
+  -v %cd%/data:/data \
+  cliproxy-account-cleaner:latest
+```
+
+Linux/macOS 的 volume 路径请改为 `$(pwd)`。
+
+## 5. 配置说明（config.json）
+
+最小可用配置（仅开启网页登录）：
+
+```json
+{
+  "web_login_username": "admin",
+  "web_login_password": "admin"
+}
+```
+
+常用业务配置示例：
+
+```json
+{
+  "base_url": "https://your-cpa-host",
+  "token": "your-token",
+  "target_type": "codex",
+  "provider": "",
+  "workers": 100,
+  "quota_workers": 100,
+  "close_workers": 20,
+  "enable_workers": 20,
+  "delete_workers": 20,
+  "timeout": 10,
+  "retries": 1,
+  "weekly_quota_threshold": 99,
+  "primary_quota_threshold": 99,
+  "auto_check_interval_minutes": 60,
+  "auto_401_action": "delete",
+  "auto_quota_action": "close",
+  "auto_keep_active_count": 100,
+  "auto_allow_closed_scan": true,
+  "web_login_username": "admin",
+  "web_login_password": "admin"
+}
+```
+
+说明：
+- `token` 与 `cpa_password` 兼容，建议只维护 `token`
+- `web_login_username/password` 都为空时，自动降级为免登录
+- 若只填一个登录字段，会给出配置提示并降级为免登录
+
+## 6. 自动巡检行为说明
+
+每轮巡检核心流程：
+
+1. 刷新并执行联合检测（401 + 额度）
+2. 按策略处理异常账号
+3. 若活跃数超出目标：关闭溢出账号并回收到备用池
+4. 若活跃数低于目标：先从备用池恢复，再按配置从已关闭池补齐
+
+其中“额度耗尽 -> 移出备用并保持关闭”的含义是：
+- 该账号不再走备用池优先补齐路径
+- 仅在允许从已关闭池补齐且额度恢复后，才可能再次被启用
+
+## 7. 常见问题
+
+### 7.1 启动报 `config.json 格式错误`
+- 先检查 JSON 语法（逗号、引号）
+- 当前代码已兼容 UTF-8 BOM；建议仍使用 UTF-8 编码保存
+
+### 7.2 开了自动巡检但没有自动关闭
+- 确认 `auto_quota_action` 是否为 `close` 或 `delete`
+- 确认你检测阈值设置合理（`weekly_quota_threshold` / `primary_quota_threshold`）
+- 先手动执行一次“联合检测”观察状态是否正确识别
+
+### 7.3 登录后立刻掉回登录页
+- 会话过期或 Cookie 被拦截，检查浏览器隐私设置
+- 确认系统时间正常
+
+## 8. 安全建议
+
+- 不要在公开仓库提交真实 `token`
+- 生产环境务必改默认登录密码
+- 建议配合反向代理启用 HTTPS
+
+---
+
+仅用于运维与测试场景，请确保使用行为符合平台条款与当地法律法规。
 
