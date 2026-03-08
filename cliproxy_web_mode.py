@@ -61,7 +61,123 @@ class WebState:
         self.auto_stop = threading.Event()
         self.auto_status = "未启动"
         self.auto_last = {}
+        self.action_progress = {
+            "op": "",
+            "running": False,
+            "total": 0,
+            "done": 0,
+            "success": 0,
+            "failed": 0,
+            "last_name": "",
+            "last_error": "",
+            "message": "",
+            "started_at": 0.0,
+            "updated_at": 0.0,
+            "ended_at": 0.0,
+        }
         self._load_standby()
+
+    def _log(self, message):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[cliproxy-web {ts}] {message}", flush=True)
+
+    def _names_preview(self, names, limit=10):
+        arr = [str(x or "").strip() for x in (names or []) if str(x or "").strip()]
+        if len(arr) <= limit:
+            return ",".join(arr)
+        return ",".join(arr[:limit]) + f"...(+{len(arr) - limit})"
+
+    def _status_summary_text(self):
+        with self.lock:
+            total = len(self.rows)
+            active = len([x for x in self.rows if self._bucket(x) == "active"])
+            closed = len([x for x in self.rows if self._bucket(x) == "closed"])
+            standby = len([x for x in self.rows if self._bucket(x) == "standby"])
+            invalid_401 = len([x for x in self.rows if self._bucket(x) == "invalid_401"])
+            invalid_quota = len([x for x in self.rows if self._bucket(x) == "invalid_quota"])
+        return f"total={total} active={active} closed={closed} standby={standby} invalid401={invalid_401} invalid_quota={invalid_quota}"
+
+    def _progress_start(self, op, total):
+        now = time.time()
+        with self.lock:
+            self.action_progress = {
+                "op": str(op or ""),
+                "running": True,
+                "total": int(total or 0),
+                "done": 0,
+                "success": 0,
+                "failed": 0,
+                "last_name": "",
+                "last_error": "",
+                "message": "",
+                "started_at": now,
+                "updated_at": now,
+                "ended_at": 0.0,
+            }
+
+    def _progress_tick(self, name, ok, err=""):
+        with self.lock:
+            p = self.action_progress
+            if not p.get("running"):
+                return
+            p["done"] = int(p.get("done") or 0) + 1
+            if ok:
+                p["success"] = int(p.get("success") or 0) + 1
+            else:
+                p["failed"] = int(p.get("failed") or 0) + 1
+            p["last_name"] = str(name or "")
+            p["last_error"] = str(err or "")
+            p["updated_at"] = time.time()
+
+    def _progress_finish(self, message=""):
+        now = time.time()
+        with self.lock:
+            p = self.action_progress
+            p["running"] = False
+            p["message"] = str(message or "")
+            p["updated_at"] = now
+            p["ended_at"] = now
+
+    def progress_snapshot(self):
+        with self.lock:
+            return dict(self.action_progress)
+
+    async def _set_disabled_with_progress(self, base_url, token, names, disabled, workers, timeout, track=False):
+        aiohttp = self.ns["aiohttp"]
+        mgmt_headers = self.ns["mgmt_headers"]
+        safe_json_text = self.ns["safe_json_text"]
+
+        async def set_one(session, sem, name):
+            url = f"{base_url}/v0/management/auth-files/status"
+            payload = {"name": name, "disabled": bool(disabled)}
+            try:
+                async with sem:
+                    async with session.patch(
+                        url,
+                        headers={**mgmt_headers(token), "Content-Type": "application/json"},
+                        json=payload,
+                        timeout=timeout,
+                    ) as resp:
+                        text = await resp.text()
+                        data = safe_json_text(text)
+                        ok = resp.status == 200 and data.get("status") == "ok"
+                        return {"name": name, "updated": ok, "disabled": bool(disabled), "status": resp.status, "error": None if ok else text[:200]}
+            except Exception as e:
+                return {"name": name, "updated": False, "disabled": bool(disabled), "status": None, "error": str(e)}
+
+        connector = aiohttp.TCPConnector(limit=max(1, workers), limit_per_host=max(1, workers))
+        client_timeout = aiohttp.ClientTimeout(total=max(1, timeout))
+        sem = asyncio.Semaphore(max(1, workers))
+
+        out = []
+        async with aiohttp.ClientSession(connector=connector, timeout=client_timeout, trust_env=True) as session:
+            tasks = [asyncio.create_task(set_one(session, sem, n)) for n in names]
+            for t in asyncio.as_completed(tasks):
+                r = await t
+                out.append(r)
+                if track:
+                    self._progress_tick(r.get("name"), bool(r.get("updated")), r.get("error") or "")
+        return out
 
     def _runtime(self, need=False):
         c = dict(self.conf)
@@ -463,7 +579,9 @@ class WebState:
         if not self.rows:
             self.refresh()
         rt = self._runtime(True)
-        c = self._cands(names, include_closed=rt["auto_fill"])
+        # 自动巡检主联合检测只扫描非关闭账号，避免在账号量大时一次性拉起海量任务。
+        # 已关闭账号的补位检测在 _auto_once 的“缺口补位”流程里按需执行。
+        c = self._cands(names, include_closed=False)
         if not c:
             return {"checked": 0, "invalid_401": 0, "invalid_quota": 0}
         refreshed = {}
@@ -473,28 +591,87 @@ class WebState:
                     refreshed[it.get("auth_index")] = it
         except Exception:
             refreshed = {}
-        p = asyncio.run(self.ns["probe_accounts"](rt["base"], rt["token"], c, rt["ua"], rt["chat_id"], rt["workers"], rt["timeout"], rt["retries"], refresh_candidates=False, refreshed_by_auth_index=refreshed))
-        q = asyncio.run(self.ns["check_quota_accounts"](rt["base"], rt["token"], c, rt["ua"], rt["chat_id"], rt["quota_workers"], rt["timeout"], rt["retries"], rt["weekly"], rt["primary"], refresh_candidates=False, refreshed_by_auth_index=refreshed))
-        self._apply_probe(p)
-        self._apply_quota(q)
-        bad401 = [x for x in p if x.get("invalid_401")]
-        badq = [x for x in q if x.get("invalid_quota")]
+
+        # 分块处理，避免 candidates 很大时一次性创建过多协程任务导致 CPU/内存冲高
+        chunk_size = max(1, min(len(c), max(1, max(rt["workers"], rt["quota_workers"]))))
+        all_probe = []
+        all_quota = []
+        for i in range(0, len(c), chunk_size):
+            chunk = c[i : i + chunk_size]
+            p = asyncio.run(
+                self.ns["probe_accounts"](
+                    rt["base"],
+                    rt["token"],
+                    chunk,
+                    rt["ua"],
+                    rt["chat_id"],
+                    rt["workers"],
+                    rt["timeout"],
+                    rt["retries"],
+                    refresh_candidates=False,
+                    refreshed_by_auth_index=refreshed,
+                )
+            )
+            q = asyncio.run(
+                self.ns["check_quota_accounts"](
+                    rt["base"],
+                    rt["token"],
+                    chunk,
+                    rt["ua"],
+                    rt["chat_id"],
+                    rt["quota_workers"],
+                    rt["timeout"],
+                    rt["retries"],
+                    rt["weekly"],
+                    rt["primary"],
+                    refresh_candidates=False,
+                    refreshed_by_auth_index=refreshed,
+                )
+            )
+            all_probe.extend(p)
+            all_quota.extend(q)
+            self._apply_probe(p)
+            self._apply_quota(q)
+
+        bad401 = [x for x in all_probe if x.get("invalid_401")]
+        badq = [x for x in all_quota if x.get("invalid_quota")]
         self.ns["write_json_file"](self._out_path(self.conf.get("output") or self.ns["DEFAULT_OUTPUT"]), bad401)
         self.ns["write_json_file"](self._out_path(self.conf.get("quota_output") or self.ns["DEFAULT_QUOTA_OUTPUT"]), badq)
         return {"checked": len(c), "invalid_401": len(bad401), "invalid_quota": len(badq)}
 
-    def close(self, names):
+    def close(self, names, track_progress=False):
         n = _names(names)
         if not n:
             return {"selected": 0, "success": 0, "failed": 0, "ok_names": []}
         rt = self._runtime(True)
-        ret = asyncio.run(self.ns["close_names"](rt["base"], rt["token"], n, rt["close_workers"], rt["timeout"]))
+        if track_progress:
+            self._progress_start("close", len(n))
+        try:
+            ret = asyncio.run(
+                self._set_disabled_with_progress(
+                    rt["base"],
+                    rt["token"],
+                    n,
+                    True,
+                    rt["close_workers"],
+                    rt["timeout"],
+                    track=bool(track_progress),
+                )
+            )
+        except Exception as e:
+            if track_progress:
+                self._progress_finish(f"关闭失败: {e}")
+            raise
         ok = {x.get("name") for x in ret if x.get("updated")}
         with self.lock:
             for a in self.rows:
                 if a.get("name") in ok:
                     a["disabled"] = True
-        return {"selected": len(n), "success": len(ok), "failed": len(n) - len(ok), "ok_names": sorted([x for x in ok if x])}
+        ok_names = sorted([x for x in ok if x])
+        if track_progress:
+            self._progress_finish(f"关闭完成: 成功={len(ok)} 失败={len(n) - len(ok)}")
+        self._log(f"关闭账号: selected={len(n)} success={len(ok)} failed={len(n) - len(ok)} names={self._names_preview(ok_names)}")
+        return {"selected": len(n), "success": len(ok), "failed": len(n) - len(ok), "ok_names": ok_names}
 
     def recover(self, names, drop_standby=False):
         n = _names(names)
@@ -516,7 +693,9 @@ class WebState:
                         a["standby"] = False
         if drop_standby and ok:
             self._save_standby()
-        return {"selected": len(n), "success": len(ok), "failed": len(n) - len(ok), "ok_names": sorted([x for x in ok if x])}
+        ok_names = sorted([x for x in ok if x])
+        self._log(f"开启账号: selected={len(n)} success={len(ok)} failed={len(n) - len(ok)} names={self._names_preview(ok_names)}")
+        return {"selected": len(n), "success": len(ok), "failed": len(n) - len(ok), "ok_names": ok_names}
 
     def add_standby(self, names):
         n = _names(names)
@@ -529,6 +708,7 @@ class WebState:
             for a in self.rows:
                 a["standby"] = a.get("name") in self.standby
         self._save_standby()
+        self._log(f"加入备用池: selected={len(n)} added={add} names={self._names_preview(n)}")
         return {"selected": len(n), "added": add}
 
     def rm_standby(self, names):
@@ -669,6 +849,7 @@ class WebState:
             self.rows = [x for x in self.rows if x.get("name") not in ok]
             self.standby = {x for x in self.standby if x not in ok}
         self._save_standby()
+        self._log(f"删除账号: selected={len(n)} success={len(ok)} failed={len(n) - len(ok)} names={self._names_preview(sorted([x for x in ok if x]))}")
         return {"selected": len(n), "success": len(ok), "failed": len(n) - len(ok)}
 
     def _auto_once(self):
@@ -749,7 +930,7 @@ class WebState:
                     standby_enabled = len([x for x in enabled_names if x in set(standby_scan.get("recoverable") or [])])
                     closed_enabled = len(enabled_names) - standby_enabled
 
-        return {
+        result = {
             "scan": s,
             "handled_401": h401,
             "handled_quota": hq,
@@ -766,6 +947,15 @@ class WebState:
             "closed_overflow_to_standby": closed_overflow_to_standby,
             "refill_error_count": len(refill_errors),
         }
+        self._log(
+            "自动巡检完成: "
+            f"checked={s.get('checked', 0)} "
+            f"bad401={s.get('invalid_401', 0)} bad_quota={s.get('invalid_quota', 0)} "
+            f"handled401={h401} handled_quota={hq} "
+            f"refill_need={refill_need} standby_enabled={standby_enabled} closed_enabled={closed_enabled} | "
+            + self._status_summary_text()
+        )
+        return result
 
     def auto_start(self):
         with self.lock:
@@ -775,6 +965,7 @@ class WebState:
             self.auto_status = "运行中"
             self.auto_last = {}
             self.auto_stop.clear()
+        self._log("自动巡检已启动")
         def w():
             while not self.auto_stop.is_set():
                 try:
@@ -785,12 +976,22 @@ class WebState:
                 except Exception as e:
                     with self.lock:
                         self.auto_status = f"异常: {e}"
-                if self.auto_stop.wait(max(1, self._runtime(False)["auto_intv"] * 60)):
-                    break
+                    self._log(f"自动巡检异常: {e}")
+
+                wait_total = max(1, self._runtime(False)["auto_intv"] * 60)
+                waited = 0
+                while waited < wait_total and not self.auto_stop.is_set():
+                    left = wait_total - waited
+                    self._log(f"自动巡检状态心跳: {self._status_summary_text()} next_scan_in={left}s")
+                    step = min(10, left)
+                    if self.auto_stop.wait(step):
+                        break
+                    waited += step
             with self.lock:
                 self.auto_running = False
                 if self.auto_status == "运行中":
                     self.auto_status = "已停止"
+            self._log("自动巡检线程已停止")
         threading.Thread(target=w, daemon=True).start()
         return {"started": True}
 
@@ -799,6 +1000,7 @@ class WebState:
             self.auto_running = False
             self.auto_status = "已停止"
         self.auto_stop.set()
+        self._log("收到停止自动巡检请求")
         return {"stopped": True}
 
 
@@ -1036,7 +1238,11 @@ function head(auto){document.getElementById("summaryLine").textContent=`加载�
 function sync(s){if(!s)return;wcfg(s.config||{});ROWS=Array.isArray(s.rows)?s.rows:[];SUM=s.summary||SUM;head(s.auto||{});const ns=new Set(ROWS.map(x=>x.name));for(const n of Array.from(SEL)){if(!ns.has(n))SEL.delete(n)}draw()}
 async function j(url,opt){const r=await fetch(url,opt);let d={};try{d=await r.json()}catch(_){d={}}if(r.status===401){const e=new Error("未登录或会话已过期，请重新登录。");e.code=401;throw e}if(!r.ok||d&&d.ok===false)throw new Error((d&&d.error)||`HTTP ${r.status}`);return d}
 function detectNames(){const s=Array.from(SEL);return s.length?s:frows().map(x=>x.name)}
-async function run(a,needSel=false,ask=""){try{let names=[];if(["check_401","check_quota","check_all"].includes(a)){names=detectNames()}else if(needSel){names=Array.from(SEL);if(!names.length){alert("请先勾选账号");return}}if(ask&&!window.confirm(ask))return;document.getElementById("actionLine").textContent="执行中...";const d=await j("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:a,config:rcfg(),selected_names:names})});if(d.state)sync(d.state);document.getElementById("actionLine").textContent=d.message||"执行完成"}catch(e){if(e.code===401){showLogin(e.message);return}document.getElementById("actionLine").textContent=`失败: ${e.message}`}}
+let CLOSE_PROGRESS_TIMER=null;
+function stopCloseProgressPoll(){if(CLOSE_PROGRESS_TIMER){clearInterval(CLOSE_PROGRESS_TIMER);CLOSE_PROGRESS_TIMER=null}}
+async function pollCloseProgressOnce(){const d=await j("/api/progress");const p=d.progress||{};if((p.op||"")!=="close"){return}const total=Number(p.total||0);const done=Number(p.done||0);const success=Number(p.success||0);const failed=Number(p.failed||0);const pct=total>0?Math.floor((done*100)/total):0;document.getElementById("actionLine").textContent=`关闭进度: ${done}/${total} (${pct}%) 成功=${success} 失败=${failed}`;if(!p.running){stopCloseProgressPoll()}}
+async function startCloseProgressPoll(){stopCloseProgressPoll();await pollCloseProgressOnce();CLOSE_PROGRESS_TIMER=setInterval(async()=>{try{await pollCloseProgressOnce()}catch(e){if(e.code===401){showLogin(e.message)}stopCloseProgressPoll()}},700)}
+async function run(a,needSel=false,ask=""){try{let names=[];if(["check_401","check_quota","check_all"].includes(a)){names=detectNames()}else if(needSel){names=Array.from(SEL);if(!names.length){alert("请先勾选账号");return}}if(ask&&!window.confirm(ask))return;document.getElementById("actionLine").textContent="执行中...";if(a==="close"){await startCloseProgressPoll()}const d=await j("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:a,config:rcfg(),selected_names:names})});if(d.state)sync(d.state);stopCloseProgressPoll();document.getElementById("actionLine").textContent=d.message||"执行完成"}catch(e){stopCloseProgressPoll();if(e.code===401){showLogin(e.message);return}document.getElementById("actionLine").textContent=`失败: ${e.message}`}}
 document.getElementById("keyword").addEventListener("input",draw);document.getElementById("statusFilter").addEventListener("change",draw);
 document.getElementById("rowsBody").addEventListener("change",e=>{const n=e.target&&e.target.dataset&&e.target.dataset.name;if(!n)return;e.target.checked?SEL.add(n):SEL.delete(n);draw()});
 document.getElementById("rowsBody").addEventListener("dblclick",e=>{const tr=e.target.closest("tr[data-name]");if(!tr)return;const n=tr.dataset.name;SEL.has(n)?SEL.delete(n):SEL.add(n);draw()});
@@ -1082,7 +1288,7 @@ def run_web_mode(host, port, no_browser, ns):
             d = state.check_all(names)
             return {"ok": True, "message": f"联合检测完成: 检测={d.get('checked', 0)} 401={d.get('invalid_401', 0)} 额度={d.get('invalid_quota', 0)}", "state": state.snapshot(), "data": d}
         if a == "close":
-            d = state.close(names); return {"ok": True, "message": f"关闭完成: 成功={d.get('success', 0)} 失败={d.get('failed', 0)}", "state": state.snapshot(), "data": d}
+            d = state.close(names, track_progress=True); return {"ok": True, "message": f"关闭完成: 成功={d.get('success', 0)} 失败={d.get('failed', 0)}", "state": state.snapshot(), "data": d}
         if a == "recover_closed":
             d = state.recover_closed_accounts(names); return {"ok": True, "message": f"恢复已关闭完成: 开启={d.get('enabled', 0)} 转备用={d.get('to_standby', 0)}", "state": state.snapshot(), "data": d}
         if a == "add_standby":
@@ -1141,6 +1347,12 @@ def run_web_mode(host, port, no_browser, ns):
             if self.path.startswith("/api/auth/state"):
                 sync_auth_runtime()
                 self._send(200, auth.auth_state(self.headers))
+                return
+            if self.path.startswith("/api/progress"):
+                if self._need_auth():
+                    self._send(401, {"ok": False, "error": "unauthorized"})
+                    return
+                self._send(200, {"ok": True, "progress": state.progress_snapshot()})
                 return
             if self.path.startswith("/api/state"):
                 if self._need_auth():
