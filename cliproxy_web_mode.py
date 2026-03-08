@@ -1207,7 +1207,8 @@ tbody td{border-bottom:1px solid #f8ddeb;padding:7px 6px;overflow:hidden;text-ov
 <div class="section"><div class="title">筛选与搜索</div><div class="row">
 <div class="field s4"><label>关键词</label><input id="keyword" placeholder="账号/邮箱/错误信息"></div>
 <div class="field s2"><label>状态筛选</label><select id="statusFilter"><option value="all">全部</option><option value="standby">备用</option><option value="active">活跃</option><option value="unknown">未知</option><option value="closed">已关闭</option><option value="invalid_401">401无效</option><option value="invalid_quota">额度耗尽</option></select></div>
-<div class="s6 note">提示: 双击表格行可切换勾选状态，检测类按钮未勾选时默认作用于当前筛选结果。</div></div></div>
+<div class="s2" style="display:flex;gap:8px;align-items:flex-end"><button class="btn" id="btnFilterAll">全部</button><button class="btn" id="btnFilterActive">仅活跃</button><button class="btn" id="btnFilterClosed">仅已关闭</button></div>
+<div class="s4 note">提示: 双击表格行可切换勾选状态，检测类按钮未勾选时默认作用于当前筛选结果。</div></div></div>
 <div class="section"><div class="title">批量操作</div>
 <div class="ops"><button class="btn" id="btnSelectAll">全选</button><button class="btn" id="btnSelectNone">取消全选</button><button class="btn" id="btnCheck401">检测401无效</button><button class="btn" id="btnCheckQuota">检测额度</button><button class="btn" id="btnCheckAll">检测（401+额度）</button><button class="btn" id="btnClose">关闭选中账号</button><button class="btn" id="btnRecover">恢复已关闭</button><button class="btn" id="btnAddStandby">加入备用池</button><button class="btn" id="btnRemoveStandby">备用转活跃</button><button class="btn danger" id="btnDelete">永久删除</button></div>
 <div class="note" id="actionLine">就绪</div></div>
@@ -1244,6 +1245,9 @@ async function pollCloseProgressOnce(){const d=await j("/api/progress");const p=
 async function startCloseProgressPoll(){stopCloseProgressPoll();await pollCloseProgressOnce();CLOSE_PROGRESS_TIMER=setInterval(async()=>{try{await pollCloseProgressOnce()}catch(e){if(e.code===401){showLogin(e.message)}stopCloseProgressPoll()}},700)}
 async function run(a,needSel=false,ask=""){try{let names=[];if(["check_401","check_quota","check_all"].includes(a)){names=detectNames()}else if(needSel){names=Array.from(SEL);if(!names.length){alert("请先勾选账号");return}}if(ask&&!window.confirm(ask))return;document.getElementById("actionLine").textContent="执行中...";if(a==="close"){await startCloseProgressPoll()}const d=await j("/api/run",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:a,config:rcfg(),selected_names:names})});if(d.state)sync(d.state);stopCloseProgressPoll();document.getElementById("actionLine").textContent=d.message||"执行完成"}catch(e){stopCloseProgressPoll();if(e.code===401){showLogin(e.message);return}document.getElementById("actionLine").textContent=`失败: ${e.message}`}}
 document.getElementById("keyword").addEventListener("input",draw);document.getElementById("statusFilter").addEventListener("change",draw);
+document.getElementById("btnFilterAll").onclick=()=>{document.getElementById("statusFilter").value="all";draw()};
+document.getElementById("btnFilterActive").onclick=()=>{document.getElementById("statusFilter").value="active";draw()};
+document.getElementById("btnFilterClosed").onclick=()=>{document.getElementById("statusFilter").value="closed";draw()};
 document.getElementById("rowsBody").addEventListener("change",e=>{const n=e.target&&e.target.dataset&&e.target.dataset.name;if(!n)return;e.target.checked?SEL.add(n):SEL.delete(n);draw()});
 document.getElementById("rowsBody").addEventListener("dblclick",e=>{const tr=e.target.closest("tr[data-name]");if(!tr)return;const n=tr.dataset.name;SEL.has(n)?SEL.delete(n):SEL.add(n);draw()});
 document.getElementById("btnSelectAll").onclick=()=>{for(const r of frows())SEL.add(r.name);draw()};document.getElementById("btnSelectNone").onclick=()=>{SEL.clear();draw()};
